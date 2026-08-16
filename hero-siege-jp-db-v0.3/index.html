@@ -16,19 +16,19 @@
 <section id="home" class="hero"><div class="wrap hero-grid"><div>
 <div class="eyebrow">NAMED UNIQUE DATABASE · v0.5</div>
 <h1>Hero Siegeを<br><em>ゲームファイルから調べる。</em></h1>
-<p class="lead">Named Uniqueを優先して整備中。日本語名・識別情報はHero Siege本体のゲームファイルを一次ソースにし、性能値・必要Lv・ドロップ情報はHeroSiegeDBを二次資料として照合しています。</p>
+<p class="lead">Named Uniqueを優先して整備中。日本語名・識別情報・性能名称はHero Siege本体のゲームファイルを一次ソースにし、性能値・必要Lv・ドロップ情報はHeroSiegeDBを二次資料として照合しています。</p>
 <div class="season-callout"><strong>現行: Season 9</strong><span>Season 10: 未稼働</span></div>
 </div><div class="hero-panel">
 <div class="metric"><strong id="itemCount">-</strong><span>Named Unique</span></div>
 <div class="metric"><strong id="uniqueCount">-</strong><span>Satanic / Heroic / Angelic</span></div>
 <div class="metric"><strong id="classCount">-</strong><span>クラス</span></div>
-<div class="metric"><strong id="verified">2026-08-16</strong><span>データ確認日</span></div>
+<div class="metric"><strong id="verified">2026-08-17</strong><span>データ確認日</span></div>
 </div></div></section>
 
 <section class="search-section"><div class="wrap"><div class="searchbox"><span>⌕</span><input id="globalSearch" placeholder="例: Aurelion Fury / オーレリオン / Butcher"></div><div id="searchResults" class="search-results"></div></div></section>
 
 <section id="items" class="section wrap">
-<div class="section-head"><div><span class="kicker">NAMED UNIQUE DATABASE · v0.5</span><h2>ユニークアイテム</h2></div><p>Satanic / Heroic / Angelic の固有名付きアイテムだけを収録。Normal・Rare・Mythic・Runewordはこの一覧から除外しています。</p></div>
+<div class="section-head"><div><span class="kicker">NAMED UNIQUE DATABASE · v0.5</span><h2>ユニークアイテム</h2></div><p>Satanic / Heroic / Angelic の固有名付きアイテムを収録。Set Itemは別系統のデータとして追加解析中です。</p></div>
 <div id="itemSourceStatus" class="source-banner loading"><b>Uniqueデータを読み込み中...</b><span>unique-manifest.json / chunk files</span></div>
 <div class="filters item-filters">
 <input id="itemSearch" placeholder="英語名 / 日本語名 / 内部ID">
@@ -45,15 +45,16 @@
 <section id="skills" class="section wrap"><div class="section-head"><div><span class="kicker">SKILLS</span><h2>スキル</h2></div><div class="filters"><select id="classFilter"><option value="">全クラス</option></select><input id="skillSearch" placeholder="スキル名検索"></div></div><div id="skillCountLabel" class="count-label"></div><div id="skillGrid" class="skill-grid"></div></section>
 <section id="augments" class="section alt"><div class="wrap"><div class="section-head"><div><span class="kicker">ANGELIC AUGMENTS</span><h2>Augment</h2></div></div><div id="augmentGrid" class="augment-grid"></div></div></section>
 <section id="sources" class="section wrap"><div class="section-head"><div><span class="kicker">SOURCE POLICY</span><h2>出典・更新方針</h2></div></div>
-<div class="policy"><div><h3>識別・日本語名</h3><p><b>Hero Siege本体のゲームファイル</b>を一次ソースにします。<code>translationsItem.csv</code> の内部ID / en / ja を基準に照合しています。</p></div><div><h3>性能・必要Lv・ドロップ</h3><p><b>HeroSiegeDB items.php</b> を二次資料として利用しています。ゲームファイルで未確認の値を含むため、詳細画面でも出典を分離して表示します。</p></div></div>
-<div class="evidence"><h3>data.win側で確認できた内部構造名</h3><code>DefineItemInitialization</code> <code>GetUniqueRandomItemID</code> <code>GetUniqueRepoStruct</code> <code>GetRunewordRepoStruct</code></div>
+<div class="policy"><div><h3>識別・日本語名・性能名称</h3><p><b>Hero Siege本体のゲームファイル</b>を一次ソースにします。<code>translationsItem.csv</code> と <code>translationsAttributes.csv</code> の日本語列を基準にしています。</p></div><div><h3>性能値・必要Lv・ドロップ</h3><p><b>HeroSiegeDB items.php</b> を二次資料として利用しています。ゲームファイルで未確認の値を含むため、詳細画面でも出典を分離して表示します。</p></div></div>
+<div class="evidence"><h3>data.win側で確認できた内部構造名</h3><code>DefineItemInitialization</code> <code>GetUniqueRandomItemID</code> <code>GetUniqueRepoStruct</code> <code>GetSetInformation</code> <code>GetSetNames</code> <code>GetRunewordRepoStruct</code></div>
 </section>
 </main>
 
 <dialog id="itemDialog"><button class="close" id="itemDialogClose" aria-label="閉じる">×</button><div id="itemDialogContent"></div></dialog>
 <dialog id="classDialog"><button class="close" id="dialogClose" aria-label="閉じる">×</button><div id="dialogContent"></div></dialog>
-<footer><div class="wrap">非公式ファン制作サイトです。Hero Siege / Panic Art Studiosとは無関係です。日本語名・識別情報はユーザー所有のゲームファイルを一次ソースとして使用しています。</div></footer>
+<footer><div class="wrap">非公式ファン制作サイトです。Hero Siege / Panic Art Studiosとは無関係です。日本語名・識別情報・性能名称はユーザー所有のゲームファイルを一次ソースとして使用しています。</div></footer>
 <script src="fetch-fallback.js"></script>
+<script src="attribute-ja.js"></script>
 <script src="app.js"></script>
 <script src="affix-ja.js"></script>
 </body></html>
