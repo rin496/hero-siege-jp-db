@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="Hero Siegeの非公式日本語データベース。ゲームファイルから直接抽出したアイテム名を検索できます。">
+<meta name="description" content="Hero Siegeの非公式日本語データベース。ゲームファイルの日本語名と照合したNamed Unique 626件を検索できます。">
 <title>Hero Siege 日本語DB</title>
 <link rel="stylesheet" href="style.css">
 </head>
@@ -14,26 +14,26 @@
 </div></header>
 <main>
 <section id="home" class="hero"><div class="wrap hero-grid"><div>
-<div class="eyebrow">UNOFFICIAL JAPANESE DATABASE · v0.4</div>
-<h1>Hero Siegeを<br><em>ゲームファイルから調べる。</em></h1>
-<p class="lead">アイテムを最優先で整備中。英語名・日本語名・内部ID・装備カテゴリはHero Siege本体の <code>translationsItem.csv</code> からブラウザ上で直接読み込みます。</p>
-<div class="season-callout"><strong>現行: Season 9</strong><span>Season 10: 未稼働</span></div>
+<div class="eyebrow">UNOFFICIAL JAPANESE DATABASE · v0.5</div>
+<h1>Hero Siegeを<br><em>日本語で調べる。</em></h1>
+<p class="lead">Named Uniqueを最優先で整備中。アイテム識別・日本語名はHero Siege本体の <code>translationsItem.csv</code> を一次ソースとして照合し、性能・必要Lv・ドロップ情報はHeroSiegeDBの公開データを二次資料として整理しています。</p>
+<div class="season-callout"><strong>現行: Season 9</strong><span>Season 10: Preview / 未稼働</span></div>
 </div><div class="hero-panel">
-<div class="metric"><strong id="itemCount">-</strong><span>装備アイテム</span></div>
-<div class="metric"><strong id="uniqueCount">-</strong><span>Unique</span></div>
+<div class="metric"><strong id="itemCount">-</strong><span>Named Unique</span></div>
+<div class="metric"><strong id="uniqueCount">-</strong><span>収録Unique</span></div>
 <div class="metric"><strong id="classCount">-</strong><span>クラス</span></div>
-<div class="metric"><strong id="verified">2026-08-16</strong><span>ゲームファイル確認日</span></div>
+<div class="metric"><strong id="verified">2026-08-17</strong><span>データ更新日</span></div>
 </div></div></section>
 
-<section class="search-section"><div class="wrap"><div class="searchbox"><span>⌕</span><input id="globalSearch" placeholder="例: Hand Axe / 手斧 / Butcher / Blender"></div><div id="searchResults" class="search-results"></div></div></section>
+<section class="search-section"><div class="wrap"><div class="searchbox"><span>⌕</span><input id="globalSearch" placeholder="例: Circle of Nature / 自然の輪 / Butcher"></div><div id="searchResults" class="search-results"></div></div></section>
 
 <section id="items" class="section wrap">
-<div class="section-head"><div><span class="kicker">ITEM DATABASE · DIRECT GAME FILE</span><h2>アイテム</h2></div><p>第三者データベースを転載せず、ゲーム本体の翻訳CSVを直接解析します。現在は装備名を優先して収録しています。</p></div>
-<div id="itemSourceStatus" class="source-banner loading"><b>ゲームファイルを読み込み中...</b><span>translationsItem.csv</span></div>
+<div class="section-head"><div><span class="kicker">NAMED UNIQUE DATABASE · v0.5</span><h2>ユニークアイテム</h2></div><p>Satanic / Heroic / Angelic の固有名付きアイテムだけを収録。Normal・Rare・Mythic・Runewordはこの一覧から除外しています。</p></div>
+<div id="itemSourceStatus" class="source-banner loading"><b>Uniqueデータを読み込み中...</b><span>game files + items.php reference data</span></div>
 <div class="filters item-filters">
 <input id="itemSearch" placeholder="英語名 / 日本語名 / 内部ID">
 <select id="slotFilter"><option value="">全装備部位</option></select>
-<select id="rarityFilter"><option value="">全レアリティ</option><option value="Normal">Normal</option><option value="Unique">Unique</option></select>
+<select id="rarityFilter"><option value="">全レアリティ</option><option value="Satanic">Satanic</option><option value="Heroic">Heroic</option><option value="Angelic">Angelic</option></select>
 <select id="weaponFilter"><option value="">全武器種</option></select>
 </div>
 <div id="itemCountLabel" class="count-label"></div>
@@ -45,13 +45,13 @@
 <section id="skills" class="section wrap"><div class="section-head"><div><span class="kicker">SKILLS</span><h2>スキル</h2></div><div class="filters"><select id="classFilter"><option value="">全クラス</option></select><input id="skillSearch" placeholder="スキル名検索"></div></div><div id="skillCountLabel" class="count-label"></div><div id="skillGrid" class="skill-grid"></div></section>
 <section id="augments" class="section alt"><div class="wrap"><div class="section-head"><div><span class="kicker">ANGELIC AUGMENTS</span><h2>Augment</h2></div></div><div id="augmentGrid" class="augment-grid"></div></div></section>
 <section id="sources" class="section wrap"><div class="section-head"><div><span class="kicker">SOURCE POLICY</span><h2>出典・更新方針</h2></div></div>
-<div class="policy"><div><h3>アイテム</h3><p><b>Hero Siege本体のゲームファイル</b>を一次ソースにします。現在は <code>translationsItem.csv</code> の内部ID / en / ja を直接使用しています。</p></div><div><h3>性能値</h3><p>要求Lv、ダメージ、固有効果などはゲームファイルから抽出できる方法を確認するまで表示しません。他サイトから数値を補完しません。</p></div></div>
-<div class="evidence"><h3>data.win側で確認できた内部構造名</h3><code>DefineItemInitialization</code> <code>GetNormalRandomItemID</code> <code>GetUniqueRandomItemID</code> <code>GetNormalRepoStruct</code> <code>GetUniqueRepoStruct</code> <code>GetRunewordRepoStruct</code></div>
+<div class="policy"><div><h3>識別・日本語名</h3><p><b>Hero Siege本体のゲームファイル</b>を一次ソースにします。<code>translationsItem.csv</code> の内部ID / 英語名 / 日本語名を使ってUniqueを照合しています。</p></div><div><h3>性能・必要Lv・ドロップ</h3><p><b>herosiegedb.com の items.php</b> を二次資料として使用しています。Affix ID、roll範囲、Required Level、Drop Areaなどを整理して表示し、ゲームファイル側で未確認の値であることを詳細画面にも明記します。</p></div></div>
+<div class="evidence"><h3>data.win側で確認できた内部構造名</h3><code>DefineItemInitialization</code> <code>GetUniqueRandomItemID</code> <code>GetUniqueRepoStruct</code> <code>GetRunewordRepoStruct</code></div>
 </section>
 </main>
 
 <dialog id="itemDialog"><button class="close" id="itemDialogClose" aria-label="閉じる">×</button><div id="itemDialogContent"></div></dialog>
 <dialog id="classDialog"><button class="close" id="dialogClose" aria-label="閉じる">×</button><div id="dialogContent"></div></dialog>
-<footer><div class="wrap">非公式ファン制作サイトです。Hero Siege / Panic Art Studiosとは無関係です。アイテム名データはユーザー所有のHero Siegeゲームファイルから抽出しています。</div></footer>
+<footer><div class="wrap">非公式ファン制作サイトです。Hero Siege / Panic Art Studiosとは無関係です。日本語名はユーザー所有のHero Siegeゲームファイルから抽出・照合しています。</div></footer>
 <script src="app.js"></script>
 </body></html>
