@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 
 title Hero Siege Master Updater
@@ -7,15 +7,22 @@ title Hero Siege Master Updater
 set "GAME_DIR=E:\SteamLibrary\steamapps\common\HeroSiege"
 set "SCRIPT=%~dp0hero_siege_master.py"
 set "TEMP_SCRIPT=%TEMP%\hero_siege_master_latest.py"
-set "RAW_URL=https://raw.githubusercontent.com/rin496/hero-siege-jp-db/main/tools/hero_siege_master.py"
+set "API_URL=https://api.github.com/repos/rin496/hero-siege-jp-db/contents/tools/hero_siege_master.py?ref=main"
 
 echo ========================================
 echo Hero Siege Master
- echo ========================================
+echo ========================================
 echo.
 
-echo [1/3] Checking latest Master...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -UseBasicParsing -Uri '%RAW_URL%' -OutFile '%TEMP_SCRIPT%'; exit 0 } catch { Write-Host $_.Exception.Message; exit 1 }"
+echo [1/3] Checking latest Master via GitHub API...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$ErrorActionPreference='Stop';" ^
+  "$h=@{'User-Agent'='HeroSiegeMasterUpdater';'Accept'='application/vnd.github+json';'Cache-Control'='no-cache'};" ^
+  "$u='%API_URL%&nocache=' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();" ^
+  "$r=Invoke-RestMethod -Headers $h -Uri $u;" ^
+  "$bytes=[Convert]::FromBase64String(($r.content -replace '\s',''));" ^
+  "[IO.File]::WriteAllBytes('%TEMP_SCRIPT%',$bytes);" ^
+  "Write-Host ('Remote blob: ' + $r.sha)"
 
 if errorlevel 1 (
     echo.
@@ -48,7 +55,6 @@ echo [2/3] Checking Python...
 where py >nul 2>&1
 if errorlevel 1 (
     echo Python launcher ^(py^) was not found.
-    echo Install Python, then run this BAT again.
     pause
     exit /b 1
 )
@@ -59,6 +65,12 @@ if not exist "%GAME_DIR%\bin\Hero_Siege.exe" if not exist "%GAME_DIR%\Hero_Siege
     pause
     exit /b 1
 )
+
+echo.
+echo Local Master version:
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$m=Select-String -Path '%SCRIPT%' -Pattern '(MASTER_VERSION|VERSION)\s*=\s*[\"''][^\"'']+[\"'']' | Select-Object -First 1;" ^
+  "if($m){Write-Host $m.Matches[0].Value}else{Write-Host 'unknown'}"
 
 echo.
 echo [3/3] Running Master...
