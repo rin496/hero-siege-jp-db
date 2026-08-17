@@ -5,7 +5,7 @@ import csv,json,os,struct,subprocess,sys,tempfile,urllib.request,zipfile,base64
 from collections import Counter
 
 VERSION="permanent-master-v11-github"
-BASE_BLOB="6d1320dcc2657d525486b9a83a44a2a16458e970"
+BASE_BLOB="70ea5a6361e8b621795bced81e4db8ed4a862378"
 BASE_API=f"https://api.github.com/repos/rin496/hero-siege-jp-db/git/blobs/{BASE_BLOB}"
 HELPER=0x0C566890
 
@@ -57,7 +57,6 @@ def parse_int(x):
 def find_helper_protocol(pe, begin, call_rva):
     a=max(begin,call_rva-0x120);b=pe.get(a,call_rva+5)
     rec={"call_rva":call_rva,"call_rva_hex":f"0x{call_rva:X}"}
-
     selectors=[]
     for i in range(max(0,len(b)-0x80),len(b)-6):
         if b[i:i+2]==b"\x8B\x15":
@@ -65,13 +64,11 @@ def find_helper_protocol(pe, begin, call_rva):
             selectors.append({"rva":r,"rva_hex":f"0x{r:X}","slot_rva":t,"slot_rva_hex":f"0x{t:X}"})
     rec["rdx_rip_loads_near_call"]=selectors
     rec["helper_selector"]=selectors[-1] if selectors else None
-
     r8s=[]
     for i in range(max(0,len(b)-0x60),len(b)-6):
         if b[i:i+2]==b"\x41\xB8":
             r8s.append({"rva":a+i,"rva_hex":f"0x{a+i:X}","imm":u32(b,i+2),"imm_hex":f"0x{u32(b,i+2):X}"})
     rec["r8d_imm"]=r8s[-1] if r8s else None
-
     vcalls=[]
     for i in range(0,len(b)-3):
         if b[i:i+3]==b"\xFF\x50\x08":
@@ -90,7 +87,6 @@ def find_helper_protocol(pe, begin, call_rva):
                                "rax_to_rdi_rva_hex":f"0x{r+3+movrdi:X}"})
     rec["rcx_source_virtual_calls"]=vcalls
     rec["rcx_source_virtual_call"]=vcalls[-1] if vcalls else None
-
     marks=[]
     pat=b"\xC7\x85\x68\x01\x00\x00"
     pos=0
@@ -100,7 +96,6 @@ def find_helper_protocol(pe, begin, call_rva):
         marks.append({"rva":a+i,"rva_hex":f"0x{a+i:X}","value":u32(b,i+6),"value_hex":f"0x{u32(b,i+6):X}"})
         pos=i+1
     rec["rbp_0x168_markers"]=marks
-
     q=rec.get("helper_selector")
     if q:q["slot"]=pe.slot(q["slot_rva"])
     vc=rec.get("rcx_source_virtual_call")
@@ -114,7 +109,6 @@ def analyze(pe,out):
         for r in csv.DictReader(f):
             key=next((k for k in r if k.lstrip("\ufeff")=="candidate_ordinal"),None)
             if key is not None:primary[int(r[key])]=r
-
     records=[];pairfreq=Counter();hfreq=Counter();vfreq=Counter();r8freq=Counter()
     for br in helper.get("blocks",[]):
         ordinal=int(br["candidate_ordinal"]);row=primary.get(ordinal,{})
@@ -129,7 +123,6 @@ def analyze(pe,out):
             hfreq[hs]+=1;vfreq[vs]+=1
             r8=rec.get("r8d_imm");r8freq[r8.get("imm_hex") if r8 else None]+=1
             records.append(rec)
-
     return {
       "summary":{
         "calls":len(records),
@@ -163,7 +156,6 @@ def main():
     finally:
         try:os.remove(tmp)
         except:pass
-
     desk=desktop();out=desk/"hero_siege_master";zpath=desk/"hero_siege_master.zip"
     pe=PE(choose_exe(root));proto=analyze(pe,out)
     (out/"consumer_helper_protocol_v11.json").write_text(json.dumps(proto,indent=2,ensure_ascii=False),encoding="utf-8")
