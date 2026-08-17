@@ -12,7 +12,7 @@ from pathlib import Path
 import argparse,csv,hashlib,json,re,shutil,struct,time,zipfile
 from collections import Counter,deque
 
-MASTER_VERSION="permanent-master-v17-journal-repo-consumer"
+MASTER_VERSION="permanent-master-v17.1-journal-repo-consumer"
 EXPECTED_SHA="92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4"
 JOURNAL_ROOT=0x093D9F60
 KNOWN_REPO_CONSUMER=0x05012E80
@@ -173,25 +173,11 @@ def graph(pe,start,depth=2,max_nodes=80):
     q.append((pe.bounds(c["target"])["begin"],d+1,path+[pe.bounds(c["target"])["begin"]]))
  return out
 
-def callers_of(pe,target):
- out=[]
- for a,z,u in pe.pdata:
-  b=pe.get(a,z);i=0;hits=[]
-  while i+5<=len(b):
-   if b[i]==0xE8:
-    r=a+i;t=(r+5+s32(b,i+1))&0xffffffff
-    if t==target:hits.append(r)
-    i+=5
-   else:i+=1
-  if hits:out.append({"caller_rva":a,"caller_rva_hex":f"0x{a:X}","size":z-a,
-                      "call_sites":[f"0x{x:X}" for x in hits]})
- return out
-
 def main():
  t0=time.time();ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir");args=ap.parse_args()
  exe=choose_exe(Path(args.hero_siege_dir).resolve());h=sha256(exe)
  print("EXE SHA256:",h,flush=True)
- if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v17 anchor assumptions.")
+ if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v17.1 anchor assumptions.")
  pe=PE(exe);d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
  if out.exists():shutil.rmtree(out)
  out.mkdir(parents=True)
@@ -204,29 +190,50 @@ def main():
   token_rows.append({"token":tok,"hits":hs,"registrations":regs})
   print(f"Token {i}/{len(TOKENS)} {tok}: hits={len(hs)} regs={len(regs)}",flush=True)
 
- print(f"Scanning Journal root 0x{JOURNAL_ROOT:X}",flush=True)
- jgraph=graph(pe,JOURNAL_ROOT,depth=2,max_nodes=120)
- repo_nodes=[]
- for n in jgraph:
-  if any(s["text"]=="gml_Script_GetUniqueRepoStruct" for s in n["string_refs"]):
-   repo_nodes.append(n)
-
- print(f"Known repo consumer 0x{KNOWN_REPO_CONSUMER:X}",flush=True)
+ print(f"Scanning known repo consumer 0x{KNOWN_REPO_CONSUMER:X}",flush=True)
+ # v16 already identified 0x5012E80 as the Journal-side consumer referencing
+ # gml_Script_GetUniqueRepoStruct. Re-scanning the enormous Journal root function
+ # recursively is unnecessary and caused v17 to stall.
  repo=scan_function(pe,KNOWN_REPO_CONSUMER)
- repo_graph=graph(pe,KNOWN_REPO_CONSUMER,depth=2,max_nodes=120)
- repo_callers=callers_of(pe,KNOWN_REPO_CONSUMER)
+ repo_graph=graph(pe,KNOWN_REPO_CONSUMER,depth=1,max_nodes=32)
+
+ # Search only the Journal neighborhood for direct CALLs to the known consumer.
+ # This is a bounded raw scan, not a whole-image caller walk.
+ region_start=max(0, JOURNAL_ROOT-0x400000)
+ region_end=JOURNAL_ROOT+0x400000
+ repo_callers=[]
+ for a,z,u in pe.pdata:
+  if z<region_start or a>region_end: continue
+  b=pe.get(a,z); i=0; hits=[]
+  while i+5<=len(b):
+   if b[i]==0xE8:
+    r=a+i; t=(r+5+s32(b,i+1))&0xffffffff
+    if t==KNOWN_REPO_CONSUMER: hits.append(r)
+    i+=5
+   else: i+=1
+  if hits:
+   repo_callers.append({"caller_rva":a,"caller_rva_hex":f"0x{a:X}",
+                        "size":z-a,"call_sites":[f"0x{x:X}" for x in hits]})
+ print(f"Journal-region callers of repo consumer: {len(repo_callers)}",flush=True)
+
+ # Also record the exact gml_Script_GetUniqueRepoStruct registration/native target.
+ repo_token=next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")
+ repo_nodes=[]
+ for reg in repo_token["registrations"]:
+  n=scan_function(pe,reg["native_rva"])
+  if n: repo_nodes.append(n)
 
  assessment={
   "journal_root_matches_expected":bool(pe.bounds(JOURNAL_ROOT)),
   "repo_consumer_matches_expected":bool(repo and repo["rva"]==KNOWN_REPO_CONSUMER),
-  "journal_nodes_referencing_get_unique_repo_struct":[n["rva_hex"] for n in repo_nodes],
+  "get_unique_repo_struct_native_nodes":[n["rva_hex"] for n in repo_nodes],
   "get_unique_repo_struct_exact_token_hits":len(next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")["hits"]),
   "get_unique_repo_struct_registration_count":len(next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")["registrations"]),
   "repo_consumer_direct_call_count":len(repo["calls"]) if repo else 0,
   "repo_consumer_rip_ref_count":len(repo["rip_refs"]) if repo else 0,
   "repo_consumer_callers_count":len(repo_callers),
   "recommended_next_step":
-   "Identify which RIP-loaded globals/selectors in 0x5012E80 are inputs/outputs of GetUniqueRepoStruct, then map the Journal callsite around that function. "
+   "Identify which RIP-loaded globals/selectors in 0x5012E80 are inputs/outputs of GetUniqueRepoStruct, then map the bounded Journal callsite around that function. "
    "If the function only materializes a runtime struct through GameMaker variable APIs, switch to a minimal read-only runtime repository dump instead of deeper producer disassembly."
  }
 
@@ -237,7 +244,8 @@ def main():
           "assessment":assessment}
  savej(out/"master_summary.json",summary)
  savej(out/"script_token_map.json",token_rows)
- savej(out/"journal_root_graph.json",jgraph)
+ savej(out/"journal_region_repo_callers.json",repo_callers)
+ savej(out/"get_unique_repo_struct_native_nodes.json",repo_nodes)
  savej(out/"repo_consumer.json",repo)
  savej(out/"repo_consumer_graph.json",repo_graph)
  savej(out/"repo_consumer_callers.json",repo_callers)
