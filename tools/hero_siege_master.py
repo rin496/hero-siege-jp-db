@@ -1,576 +1,143 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Hero Siege Standalone Journal -> Repo Consumer Scanner
-======================================================
-Focused follow-up to v16. Targets the actual Journal-side symbol spelling
-(gml_Script_*) observed in native Journal functions, especially GetUniqueRepoStruct.
-
-Static analysis only. No runtime injection.
-"""
 from pathlib import Path
-import argparse,csv,hashlib,json,re,shutil,struct,time,zipfile
-from collections import Counter,deque
+import argparse, ctypes, hashlib, json, os, shutil, struct, time, zipfile
+from ctypes import wintypes
 
-MASTER_VERSION="permanent-master-v23.1-writer-only-fast-scan"
+MASTER_VERSION="permanent-master-v24-readonly-runtime-probe"
 EXPECTED_SHA="92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4"
-JOURNAL_ROOT=0x093D9F60
-KNOWN_REPO_CONSUMER=0x05012E80
-COMPARE_CONSUMERS={
- "Normal":0x05012370,
- "Unique":0x05012E80,
- "Runeword":0x05013990,
- "Heroic":0x05013C90,
- "Translation":0x05014970,
- "Mask":0x0501A4E0,
+ROOT_RVA=0x11CD4BB8
+DESCRIPTORS={
+ "itemAmountUnique":0x119A80D8,
+ "itemArgument":0x119A80E8,
+ "itemRepoRuneword":0x119A8718,
+ "itemRepoUnique":0x119A8728,
+ "itemRequiredText":0x119A8738,
+ "gml_Script_GetUniqueRepoStruct":0x119F9B98,
+ "gml_Script_GetRunewordRepoStruct":0x119F9BA8,
+ "gml_Script_GetHeroicItem":0x119F9BB8,
 }
-
-TOKENS=[
- "gml_Script_GetUniqueRepoStruct",
- "gml_Script_GetNormalRepoStruct",
- "gml_Script_GetRunewordRepoStruct",
- "gml_Script_GetHeroicItem",
- "gml_Script_GetItemTranslationServerData",
- "gml_Script_GetItemMask",
- "gml_Script_GetLootSprite",
- "gml_Script_GetSetInformation",
- "gml_Script_GetSetNames",
- "gml_Script_GetSetName",
- "gml_Script_GetItemSeed",
-]
-
-def u16(b,o):return struct.unpack_from("<H",b,o)[0]
-def u32(b,o):return struct.unpack_from("<I",b,o)[0]
-def u64(b,o):return struct.unpack_from("<Q",b,o)[0]
-def s32(b,o):return struct.unpack_from("<i",b,o)[0]
+PROCESS_NAME="Hero_Siege.exe"
 
 def sha256(p):
  h=hashlib.sha256()
  with p.open("rb") as f:
-  for c in iter(lambda:f.read(1<<20),b""):h.update(c)
+  for c in iter(lambda:f.read(1<<20),b""): h.update(c)
  return h.hexdigest()
 
 def desktop():
  for p in (Path.home()/"Desktop",Path.home()/"OneDrive"/"Desktop"):
-  if p.exists():return p
+  if p.exists(): return p
  return Path.cwd()
 
 def choose_exe(root):
- for p in (root/"Hero_Siege.exe",root/"bin"/"Hero_Siege.exe",root/"Hero Siege.exe",root/"bin"/"Hero Siege.exe"):
-  if p.exists():return p
+ for p in (root/"Hero_Siege.exe",root/"bin"/"Hero_Siege.exe"):
+  if p.exists(): return p
  xs=list(root.rglob("Hero_Siege.exe"))
- if not xs:raise SystemExit("Hero_Siege.exe not found")
+ if not xs: raise SystemExit("Hero_Siege.exe not found")
  return xs[0]
 
-def savej(p,x):p.write_text(json.dumps(x,indent=2,ensure_ascii=False),encoding="utf-8")
+def savej(p,x):
+ p.write_text(json.dumps(x,indent=2,ensure_ascii=False),encoding="utf-8")
 
-class PE:
- def __init__(self,p):
-  self.data=p.read_bytes();self.sections=[];self._parse()
- def _parse(self):
-  d=self.data;pe=u32(d,0x3c);coff=pe+4;n=u16(d,coff+2);osz=u16(d,coff+16);opt=coff+20
-  self.image_base=u64(d,opt+24);self.size_image=u32(d,opt+56);sec=opt+osz
-  for i in range(n):
-   o=sec+i*40
-   self.sections.append({"name":d[o:o+8].split(b"\0",1)[0].decode("ascii","ignore"),
-    "vs":u32(d,o+8),"rva":u32(d,o+12),"rs":u32(d,o+16),"rp":u32(d,o+20),
-    "exec":bool(u32(d,o+36)&0x20000000)})
-  ps=next(x for x in self.sections if x["name"]==".pdata");self.pdata=[]
-  for i in range(ps["rs"]//12):
-   o=ps["rp"]+i*12;self.pdata.append((u32(d,o),u32(d,o+4),u32(d,o+8)))
- def off(self,r):
-  for s in self.sections:
-   if s["rva"]<=r<s["rva"]+max(s["vs"],s["rs"]):
-    q=r-s["rva"]
-    if q<s["rs"]:return s["rp"]+q
- def rva_from_off(self,o):
-  for s in self.sections:
-   if s["rp"]<=o<s["rp"]+s["rs"]:return s["rva"]+(o-s["rp"])
- def va_to_rva(self,v):
-  r=v-self.image_base
-  return r if 0<=r<self.size_image else None
- def get(self,a,z):
-  o=self.off(a);return b"" if o is None else self.data[o:o+z-a]
- def executable(self,r):
-  return any(s["exec"] and s["rva"]<=r<s["rva"]+max(s["vs"],s["rs"]) for s in self.sections)
- def bounds(self,r):
-  for a,z,u in self.pdata:
-   if a<=r<z:return {"begin":a,"end":z,"size":z-a,"unwind":u}
- def section(self,r):
-  for s in self.sections:
-   if s["rva"]<=r<s["rva"]+max(s["vs"],s["rs"]):return s["name"]
- def cstr(self,r,n=220):
-  o=self.off(r)
-  if o is None:return None
-  raw=self.data[o:o+n];q=raw.find(b"\0")
-  if q>=0:raw=raw[:q]
-  if not raw:return None
-  try:s=raw.decode("utf-8")
-  except:return None
-  if not all((31<ord(c)<127) or c in "\t\r\n" for c in s):return None
-  return s
+def hx(v): return None if v is None else f"0x{v:X}"
 
-def find_ascii(pe,text):
- needle=text.encode("ascii");out=[];pos=0
- while True:
-  o=pe.data.find(needle,pos)
-  if o<0:break
-  pos=o+1;r=pe.rva_from_off(o)
-  if r is not None:out.append({"rva":r,"rva_hex":f"0x{r:X}","off":o})
- return out
+class PROCESSENTRY32W(ctypes.Structure):
+ _fields_=[("dwSize",wintypes.DWORD),("cntUsage",wintypes.DWORD),("th32ProcessID",wintypes.DWORD),("th32DefaultHeapID",ctypes.c_size_t),("th32ModuleID",wintypes.DWORD),("cntThreads",wintypes.DWORD),("th32ParentProcessID",wintypes.DWORD),("pcPriClassBase",ctypes.c_long),("dwFlags",wintypes.DWORD),("szExeFile",wintypes.WCHAR*260)]
 
-def registrations(pe,hit):
- needle=struct.pack("<Q",pe.image_base+hit["rva"]);d=pe.data;out=[];pos=0
- while True:
-  q=d.find(needle,pos)
-  if q<0:break
-  pos=q+1
-  if q+24>len(d):continue
-  fv=u64(d,q+8);fr=pe.va_to_rva(fv)
-  if fr is not None and pe.executable(fr) and pe.bounds(fr):
-   out.append({"registration_off":q,"native_rva":pe.bounds(fr)["begin"],
-               "native_rva_hex":f"0x{pe.bounds(fr)['begin']:X}","metadata_va":u64(d,q+16)})
- u={}
- for x in out:u[x["native_rva"]]=x
- return list(u.values())
+class MODULEENTRY32W(ctypes.Structure):
+ _fields_=[("dwSize",wintypes.DWORD),("th32ModuleID",wintypes.DWORD),("th32ProcessID",wintypes.DWORD),("GlblcntUsage",wintypes.DWORD),("ProccntUsage",wintypes.DWORD),("modBaseAddr",ctypes.POINTER(ctypes.c_byte)),("modBaseSize",wintypes.DWORD),("hModule",wintypes.HMODULE),("szModule",wintypes.WCHAR*256),("szExePath",wintypes.WCHAR*260)]
 
-def scan_function(pe,r):
- bd=pe.bounds(r)
- if not bd:return None
- a,z=bd["begin"],bd["end"];b=pe.get(a,z);calls=[];refs=[];strings=[];i=0
- while i<len(b):
-  cur=a+i
-  if i+5<=len(b) and b[i]==0xE8:
-   t=(cur+5+s32(b,i+1))&0xffffffff
-   calls.append({"at":cur,"at_hex":f"0x{cur:X}","target":t,"target_hex":f"0x{t:X}","exec":pe.executable(t)})
-   i+=5;continue
-  if i+6<=len(b) and b[i] in (0x8B,0x8D) and (b[i+1]&0xC7)==0x05:
-   t=(cur+6+s32(b,i+2))&0xffffffff
-   rec={"at":cur,"at_hex":f"0x{cur:X}","kind":"mov32" if b[i]==0x8B else "lea32",
-        "target":t,"target_hex":f"0x{t:X}","section":pe.section(t)}
-   refs.append(rec);s=pe.cstr(t)
-   if s:strings.append({**rec,"text":s})
-   i+=6;continue
-  if i+7<=len(b) and 0x40<=b[i]<=0x4f and b[i+1] in (0x8B,0x8D) and (b[i+2]&0xC7)==0x05:
-   t=(cur+7+s32(b,i+3))&0xffffffff
-   rec={"at":cur,"at_hex":f"0x{cur:X}","kind":"mov64" if b[i+1]==0x8B else "lea64",
-        "target":t,"target_hex":f"0x{t:X}","section":pe.section(t)}
-   refs.append(rec);s=pe.cstr(t)
-   if s:strings.append({**rec,"text":s})
-   i+=7;continue
-  i+=1
- ur={};us={}
- for x in refs:ur[(x["kind"],x["target"])]=x
- for x in strings:us[(x["target"],x["text"])]=x
- return {"rva":bd["begin"],"rva_hex":f"0x{bd['begin']:X}","end":bd["end"],"end_hex":f"0x{bd['end']:X}",
-         "size":bd["size"],"calls":calls,"rip_refs":list(ur.values()),"string_refs":list(us.values())}
+def find_process():
+ k=ctypes.WinDLL("kernel32",use_last_error=True);snap=k.CreateToolhelp32Snapshot(0x2,0)
+ if snap in (0,-1): return None
+ try:
+  e=PROCESSENTRY32W();e.dwSize=ctypes.sizeof(e);ok=k.Process32FirstW(snap,ctypes.byref(e))
+  while ok:
+   if e.szExeFile.lower()==PROCESS_NAME.lower(): return int(e.th32ProcessID)
+   ok=k.Process32NextW(snap,ctypes.byref(e))
+ finally:k.CloseHandle(snap)
+ return None
 
-def graph(pe,start,depth=2,max_nodes=80):
- q=deque([(start,0,[start])]);seen=set();out=[]
- while q and len(out)<max_nodes:
-  r,d,path=q.popleft();bd=pe.bounds(r)
-  if not bd:continue
-  r=bd["begin"]
-  if r in seen:continue
-  seen.add(r);n=scan_function(pe,r)
-  if not n:continue
-  out.append({"depth":d,"path":[f"0x{x:X}" for x in path],**n})
-  if d>=depth:continue
-  for c in n["calls"]:
-   if c["exec"] and pe.bounds(c["target"]):
-    q.append((pe.bounds(c["target"])["begin"],d+1,path+[pe.bounds(c["target"])["begin"]]))
- return out
+def module_base(pid):
+ k=ctypes.WinDLL("kernel32",use_last_error=True);snap=k.CreateToolhelp32Snapshot(0x8|0x10,pid)
+ if snap in (0,-1): return None
+ try:
+  m=MODULEENTRY32W();m.dwSize=ctypes.sizeof(m);ok=k.Module32FirstW(snap,ctypes.byref(m))
+  while ok:
+   if m.szModule.lower()==PROCESS_NAME.lower(): return ctypes.cast(m.modBaseAddr,ctypes.c_void_p).value,int(m.modBaseSize),m.szExePath
+   ok=k.Module32NextW(snap,ctypes.byref(m))
+ finally:k.CloseHandle(snap)
+ return None
 
-def raw_at_rva(pe,r,n=32):
- o=pe.off(r)
- if o is None:return None
- b=pe.data[o:o+n]
- return {"rva":r,"rva_hex":f"0x{r:X}","section":pe.section(r),
-         "hex":b.hex(" "),"u32":u32(b,0) if len(b)>=4 else None,
-         "u64":u64(b,0) if len(b)>=8 else None}
+class Reader:
+ def __init__(self,pid):
+  self.k=ctypes.WinDLL("kernel32",use_last_error=True);self.h=self.k.OpenProcess(0x10|0x400,False,pid)
+  if not self.h: raise OSError(ctypes.get_last_error(),"OpenProcess failed")
+ def close(self):
+  if self.h:self.k.CloseHandle(self.h);self.h=None
+ def read(self,addr,n):
+  buf=(ctypes.c_ubyte*n)();got=ctypes.c_size_t();ok=self.k.ReadProcessMemory(self.h,ctypes.c_void_p(addr),buf,n,ctypes.byref(got))
+  if not ok or got.value==0:return None
+  return bytes(buf[:got.value])
+ def u64(self,addr):
+  b=self.read(addr,8);return struct.unpack("<Q",b)[0] if b and len(b)>=8 else None
 
-def callsite_window(pe,at,before=96,after=96):
- bd=pe.bounds(at)
- if not bd:return None
- a=max(bd["begin"],at-before);z=min(bd["end"],at+after)
- return {"callsite_hex":f"0x{at:X}","function_begin_hex":f"0x{bd['begin']:X}",
-         "start_hex":f"0x{a:X}","end_hex":f"0x{z:X}",
-         "bytes_hex":pe.get(a,z).hex(" ")}
+def ptr_class(v,base,size):
+ if not v:return "null"
+ if base<=v<base+size:return "module"
+ if 0x10000<=v<=0x00007FFFFFFFFFFF:return "user_pointer_candidate"
+ return "scalar_or_invalid"
 
-def compare_consumers(pe):
- rows=[]; all_ref_sets={}
- for name,r in COMPARE_CONSUMERS.items():
-  n=scan_function(pe,r)
-  if not n:
-   rows.append({"name":name,"rva_hex":f"0x{r:X}","missing":True});continue
-  refs=[]
-  for rr in n["rip_refs"]:
-   raw=raw_at_rva(pe,rr["target"],32)
-   refs.append({**rr,"raw":raw})
-  refset=set(rr["target_hex"] for rr in n["rip_refs"])
-  all_ref_sets[name]=refset
-  rows.append({"name":name,"rva_hex":n["rva_hex"],"size":n["size"],
-               "call_count":len(n["calls"]),"rip_ref_count":len(n["rip_refs"]),
-               "string_refs":n["string_refs"],"rip_refs":refs})
- common=sorted(set.intersection(*(s for s in all_ref_sets.values() if s))) if all_ref_sets else []
- pairwise=[]
- names=list(all_ref_sets)
- for i,a in enumerate(names):
-  for b in names[i+1:]:
-   inter=sorted(all_ref_sets[a]&all_ref_sets[b])
-   if inter: pairwise.append({"a":a,"b":b,"shared_refs":inter,"count":len(inter)})
- return rows,common,pairwise
-
-def describe_data_ref(pe,r,n=48):
- o=pe.off(r)
- if o is None:return {"rva_hex":f"0x{r:X}","unmapped":True}
- b=pe.data[o:o+n]
- qwords=[]; dwords=[]
- for off in range(0,min(len(b),32),8):
-  if off+8<=len(b):
-   v=u64(b,off); rr=pe.va_to_rva(v)
-   ent={"offset":off,"value":v,"value_hex":f"0x{v:X}"}
-   if rr is not None:
-    ent["points_to_rva_hex"]=f"0x{rr:X}"
-    ent["points_to_section"]=pe.section(rr)
-    s=pe.cstr(rr,320)
-    if s:ent["points_to_string"]=s
-   qwords.append(ent)
- for off in range(0,min(len(b),24),4):
-  if off+4<=len(b):
-   dwords.append({"offset":off,"value":u32(b,off),"value_hex":f"0x{u32(b,off):X}"})
- return {"rva":r,"rva_hex":f"0x{r:X}","section":pe.section(r),
-         "hex":b.hex(" "),"qwords":qwords,"dwords":dwords}
-
-def selector_descriptor_report(pe,consumer_compare):
- rows=[]
- for c in consumer_compare:
-  if c.get("missing"):continue
-  for rr in c.get("rip_refs",[]):
-   target=rr["target"]
-   desc=describe_data_ref(pe,target,48)
-   rows.append({"consumer":c["name"],"consumer_rva_hex":c["rva_hex"],
-                "kind":rr["kind"],"target_hex":rr["target_hex"],"descriptor":desc})
- return rows
-
-def exact_descriptor_label(pe,target):
- o=pe.off(target)
- if o is None:return None
- if o+16>len(pe.data):return None
- cache=u64(pe.data,o); nameva=u64(pe.data,o+8); nr=pe.va_to_rva(nameva)
- return {"target_hex":f"0x{target:X}","cache_value":cache,"cache_value_hex":f"0x{cache:X}",
-         "name_va_hex":f"0x{nameva:X}","name_rva_hex":f"0x{nr:X}" if nr is not None else None,
-         "name":pe.cstr(nr,320) if nr is not None else None}
-
-def rip_ref_instruction_windows(pe,consumer_compare):
+def pointer_samples(reader,blob,base,size,start_addr,max_samples=64):
  out=[]
- for c in consumer_compare:
-  if c.get("missing"):continue
-  n=scan_function(pe,int(c["rva_hex"],16))
-  if not n:continue
-  for rr in n["rip_refs"]:
-   at=rr["at"]; bd=pe.bounds(at)
-   a=max(bd["begin"],at-48); z=min(bd["end"],at+80)
-   out.append({"consumer":c["name"],"consumer_rva_hex":c["rva_hex"],
-               "at_hex":rr["at_hex"],"kind":rr["kind"],"target_hex":rr["target_hex"],
-               "descriptor":exact_descriptor_label(pe,rr["target"]),
-               "window_start_hex":f"0x{a:X}","window_end_hex":f"0x{z:X}",
-               "bytes_hex":pe.get(a,z).hex(" ")})
- return out
-
-def find_variable_access_protocols(pe, consumer_compare):
- out=[]
- for c in consumer_compare:
-  if c.get("missing"): continue
-  r=int(c["rva_hex"],16); bd=pe.bounds(r)
-  if not bd: continue
-  b=pe.get(bd["begin"],bd["end"]); a=bd["begin"]
-  i=0
-  while i+16<=len(b):
-   cur=a+i
-   if (i+19<=len(b) and b[i:i+3]==b"\x48\x8b\x0d" and
-       b[i+7:i+9]==b"\x8b\x15" and b[i+13:i+19]==b"\x48\x8b\x01\xff\x50\x08"):
-    recv=(cur+7+s32(b,i+3))&0xffffffff
-    desc=(cur+13+s32(b,i+9))&0xffffffff
-    lab=exact_descriptor_label(pe,desc)
-    out.append({
-      "consumer":c["name"],"consumer_rva_hex":c["rva_hex"],
-      "at_hex":f"0x{cur:X}","receiver_global_hex":f"0x{recv:X}",
-      "receiver_section":pe.section(recv),
-      "receiver_raw":raw_at_rva(pe,recv,32),
-      "descriptor_hex":f"0x{desc:X}",
-      "descriptor_name":lab.get("name") if lab else None,
-      "descriptor_cache":lab.get("cache_value") if lab else None,
-      "protocol":"virtual_property_lookup_rcx_receiver_edx_selector_vtable_plus_8"
-    })
-    i+=19; continue
-   i+=1
- return out
-
-def executable_rip_xrefs(pe,target,max_hits=500):
- out=[]
- for s in pe.sections:
-  if not s["exec"]: continue
-  b=pe.data[s["rp"]:s["rp"]+s["rs"]]; base=s["rva"]; i=0
-  while i+7<=len(b) and len(out)<max_hits:
-   if 0x40<=b[i]<=0x4F and b[i+1] in (0x8B,0x89,0x8D) and (b[i+2]&0xC7)==0x05:
-    cur=base+i; t=(cur+7+s32(b,i+3))&0xffffffff
-    if t==target:
-     op=b[i+1]
-     out.append({"at_hex":f"0x{cur:X}",
-                 "kind":"read" if op==0x8B else ("write" if op==0x89 else "lea"),
-                 "bytes_hex":b[i:i+7].hex(" ")})
-    i+=7; continue
-   if b[i] in (0x8B,0x89,0x8D) and (b[i+1]&0xC7)==0x05:
-    cur=base+i; t=(cur+6+s32(b,i+2))&0xffffffff
-    if t==target:
-     op=b[i]
-     out.append({"at_hex":f"0x{cur:X}",
-                 "kind":"read" if op==0x8B else ("write" if op==0x89 else "lea"),
-                 "bytes_hex":b[i:i+6].hex(" ")})
-    i+=6; continue
-   i+=1
- return out
-
-def annotate_variable_access_flow(pe,accesses):
- out=[]
- for a0 in accesses:
-  at=int(a0["at_hex"],16); bd=pe.bounds(at)
-  if not bd: continue
-  start=at; end=min(bd["end"],at+180); b=pe.get(start,end)
-  post_off=19
-  next_desc=None; next_call=None; return_store=None
-  i=post_off
-  while i<len(b):
-   cur=start+i
-   if return_store is None:
-    if i+4<=len(b) and b[i:i+3] in (b"\x48\x89\x45",):
-     return_store={"at_hex":f"0x{cur:X}","bytes_hex":b[i:i+4].hex(" ")}
-    elif i+7<=len(b) and b[i:i+3]==b"\x48\x89\x85":
-     return_store={"at_hex":f"0x{cur:X}","bytes_hex":b[i:i+7].hex(" ")}
-    elif i+3<=len(b) and b[i:i+2] in (b"\x49\x89",b"\x48\x89"):
-     return_store={"at_hex":f"0x{cur:X}","bytes_hex":b[i:i+3].hex(" ")}
-   if next_desc is None and i+6<=len(b) and b[i]==0x8B and (b[i+1]&0xC7)==0x05:
-    t=(cur+6+s32(b,i+2))&0xffffffff
-    lab=exact_descriptor_label(pe,t)
-    if lab and lab.get("name"):
-     next_desc={"at_hex":f"0x{cur:X}","target_hex":f"0x{t:X}","name":lab["name"],"cache":lab["cache_value"]}
-   if b[i]==0xE8 and i+5<=len(b):
-    t=(cur+5+s32(b,i+1))&0xffffffff
-    next_call={"at_hex":f"0x{cur:X}","target_hex":f"0x{t:X}"}
-    if next_desc is not None: break
-   i+=1
-  out.append({**a0,"return_store":return_store,"next_named_descriptor":next_desc,
-              "next_direct_call":next_call,"post_bytes_hex":b[post_off:].hex(" ")})
- return out
-
-def receiver_write_scan(pe,target,read_sample_limit=0):
- # Fast writer-only scan. Search only opcode prefixes, then validate RIP disp32.
- # Avoid full byte-by-byte traversal and avoid counting all reads.
- writes=[]; leas=[]; tested=0
- for sec in pe.sections:
-  if not sec["exec"]: continue
-  b=pe.data[sec["rp"]:sec["rp"]+sec["rs"]]; base=sec["rva"]
-  patterns=[]
-  for rex in range(0x40,0x50):
-   patterns.append((bytes([rex,0x89]),"write_rex",7))
-   patterns.append((bytes([rex,0x8D]),"lea_rex",7))
-  patterns += [(b"\x89","write32",6),(b"\x8D","lea32",6),(b"\x48\xC7\x05","write_imm32",11)]
-  for pat,kind,inslen in patterns:
-   pos=0
-   while True:
-    i=b.find(pat,pos)
-    if i<0: break
-    pos=i+1; tested+=1
-    if kind in ("write_rex","lea_rex"):
-     if i+7>len(b) or (b[i+2]&0xC7)!=0x05: continue
-     cur=base+i; t=(cur+7+s32(b,i+3))&0xffffffff
-     raw=b[i:i+7]
-    elif kind in ("write32","lea32"):
-     if i+6>len(b) or (b[i+1]&0xC7)!=0x05: continue
-     cur=base+i; t=(cur+6+s32(b,i+2))&0xffffffff
-     raw=b[i:i+6]
-    else:
-     if i+11>len(b): continue
-     cur=base+i; t=(cur+11+s32(b,i+3))&0xffffffff
-     raw=b[i:i+11]
-    if t!=target: continue
-    bd=pe.bounds(cur)
-    rec={"at_hex":f"0x{cur:X}","kind":kind,"bytes_hex":raw.hex(" "),
-         "function_rva_hex":f"0x{bd['begin']:X}" if bd else None}
-    if kind=="write_imm32": rec["imm32"]=u32(b,i+7)
-    if kind.startswith("write"): writes.append(rec)
-    else: leas.append(rec)
- def dedup(xs):
-  u={}
-  for x in xs:u[(x["at_hex"],x["kind"])]=x
-  return list(u.values())
- writes=dedup(writes);leas=dedup(leas)
- return {"target_hex":f"0x{target:X}","scan_mode":"writer-only-bytes-find",
-         "candidate_prefix_hits_tested":tested,
-         "counts":{"read":None,"write":len(writes),"lea":len(leas)},
-         "writes":writes,"leas":leas,"read_samples":[]}
-
-def writer_contexts(pe,write_report,before=96,after=160):
- out=[]
- for w in write_report.get("writes",[]):
-  at=int(w["at_hex"],16);bd=pe.bounds(at)
-  if not bd:continue
-  a=max(bd["begin"],at-before);z=min(bd["end"],at+after)
-  n=scan_function(pe,bd["begin"])
-  out.append({**w,"function_begin_hex":f"0x{bd['begin']:X}",
-              "function_size":bd["size"],"window_start_hex":f"0x{a:X}",
-              "window_end_hex":f"0x{z:X}","bytes_hex":pe.get(a,z).hex(" "),
-              "function_string_refs":n["string_refs"] if n else []})
+ for off in range(0,len(blob)-7,8):
+  v=struct.unpack_from("<Q",blob,off)[0];cls=ptr_class(v,base,size)
+  if cls in ("scalar_or_invalid","null"):continue
+  sm=reader.read(v,32);out.append({"offset":off,"field_addr_hex":hx(start_addr+off),"value_hex":hx(v),"class":cls,"module_rva_hex":hx(v-base) if cls=="module" else None,"sample_hex":sm.hex(" ") if sm else None})
+  if len(out)>=max_samples:break
  return out
 
 def main():
- t0=time.time();ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir");args=ap.parse_args()
- exe=choose_exe(Path(args.hero_siege_dir).resolve());h=sha256(exe)
+ if os.name!="nt": raise SystemExit("v24 runtime probe must run on Windows.")
+ t=time.time();ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir");root=Path(ap.parse_args().hero_siege_dir).resolve();exe=choose_exe(root);h=sha256(exe)
  print("EXE SHA256:",h,flush=True)
- if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v23.1 anchor assumptions.")
- pe=PE(exe);d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
+ if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v24 anchors.")
+ d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
  if out.exists():shutil.rmtree(out)
  out.mkdir(parents=True)
-
- token_rows=[]
- for i,tok in enumerate(TOKENS,1):
-  hs=find_ascii(pe,tok);regs=[]
-  for h0 in hs:regs.extend(registrations(pe,h0))
-  uq={x["native_rva"]:x for x in regs};regs=list(uq.values())
-  token_rows.append({"token":tok,"hits":hs,"registrations":regs})
-  print(f"Token {i}/{len(TOKENS)} {tok}: hits={len(hs)} regs={len(regs)}",flush=True)
-
- print(f"Scanning known repo consumer 0x{KNOWN_REPO_CONSUMER:X}",flush=True)
- repo=scan_function(pe,KNOWN_REPO_CONSUMER)
- repo_graph=graph(pe,KNOWN_REPO_CONSUMER,depth=1,max_nodes=32)
-
- region_start=max(0, JOURNAL_ROOT-0x400000)
- region_end=JOURNAL_ROOT+0x400000
- repo_callers=[]
- for a,z,u in pe.pdata:
-  if z<region_start or a>region_end: continue
-  b=pe.get(a,z); i=0; hits=[]
-  while i+5<=len(b):
-   if b[i]==0xE8:
-    r=a+i; t=(r+5+s32(b,i+1))&0xffffffff
-    if t==KNOWN_REPO_CONSUMER: hits.append(r)
-    i+=5
-   else: i+=1
-  if hits:
-   repo_callers.append({"caller_rva":a,"caller_rva_hex":f"0x{a:X}",
-                        "size":z-a,"call_sites":[f"0x{x:X}" for x in hits]})
- print(f"Journal-region callers of repo consumer: {len(repo_callers)}",flush=True)
-
- callsite_windows=[]
- for c in repo_callers:
-  for hs in c["call_sites"]:
-   at=int(hs,16)
-   w=callsite_window(pe,at,128,128)
-   if w: callsite_windows.append(w)
- print(f"Captured Journal callsite windows: {len(callsite_windows)}",flush=True)
-
- consumer_compare,common_refs,pairwise_refs=compare_consumers(pe)
- print("Compared repository consumers:",len(consumer_compare),flush=True)
-
- descriptor_rows=selector_descriptor_report(pe,consumer_compare)
- exact_labels=[]
- for row in descriptor_rows:
-  lab=exact_descriptor_label(pe,int(row["target_hex"],16))
-  if lab and lab.get("name"):
-   exact_labels.append({"consumer":row["consumer"],"consumer_rva_hex":row["consumer_rva_hex"],**lab})
- ref_windows=rip_ref_instruction_windows(pe,consumer_compare)
- variable_accesses=find_variable_access_protocols(pe,consumer_compare)
- variable_access_flows=annotate_variable_access_flow(pe,variable_accesses)
- receiver_globals=sorted(set(int(x["receiver_global_hex"],16) for x in variable_accesses))
- receiver_xrefs={}  # v23.1: intentionally skipped; writer-only scan
- print("Fast writer-only scan...",flush=True)
- receiver_write_reports={f"0x{r:X}":receiver_write_scan(pe,r,0) for r in receiver_globals}
- receiver_writer_contexts={k:writer_contexts(pe,v) for k,v in receiver_write_reports.items()}
- named_ptrs=[]
- for row in descriptor_rows:
-  for q in row["descriptor"].get("qwords",[]):
-   s=q.get("points_to_string")
-   if s:
-    named_ptrs.append({"consumer":row["consumer"],"target_hex":row["target_hex"],
-                       "offset":q["offset"],"points_to_rva_hex":q.get("points_to_rva_hex"),
-                       "string":s})
- print(f"Resolved data-ref string pointers: {len(named_ptrs)}",flush=True)
- print(f"Exact descriptor labels: {len(exact_labels)}",flush=True)
- print(f"RIP-ref instruction windows: {len(ref_windows)}",flush=True)
- print(f"Variable access protocols: {len(variable_accesses)}",flush=True)
- print(f"Receiver globals: {len(receiver_globals)}",flush=True)
- print("Receiver writes:",sum(v["counts"]["write"] for v in receiver_write_reports.values()),flush=True)
- print("Receiver LEAs:",sum(v["counts"]["lea"] for v in receiver_write_reports.values()),flush=True)
-
- repo_token=next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")
- repo_nodes=[]
- for reg in repo_token["registrations"]:
-  n=scan_function(pe,reg["native_rva"])
-  if n: repo_nodes.append(n)
-
- assessment={
-  "journal_root_matches_expected":bool(pe.bounds(JOURNAL_ROOT)),
-  "repo_consumer_matches_expected":bool(repo and repo["rva"]==KNOWN_REPO_CONSUMER),
-  "get_unique_repo_struct_native_nodes":[n["rva_hex"] for n in repo_nodes],
-  "get_unique_repo_struct_exact_token_hits":len(next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")["hits"]),
-  "get_unique_repo_struct_registration_count":len(next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")["registrations"]),
-  "repo_consumer_direct_call_count":len(repo["calls"]) if repo else 0,
-  "repo_consumer_rip_ref_count":len(repo["rip_refs"]) if repo else 0,
-  "repo_consumer_callers_count":len(repo_callers),
-  "journal_callsite_window_count":len(callsite_windows),
-  "compared_consumer_count":len(consumer_compare),
-  "common_rip_refs_across_compared_consumers":common_refs,
-  "resolved_data_ref_string_pointer_count":len(named_ptrs),
-  "exact_descriptor_label_count":len(exact_labels),
-  "rip_ref_instruction_window_count":len(ref_windows),
-  "variable_access_protocol_count":len(variable_accesses),
-  "receiver_global_count":len(receiver_globals),
-  "receiver_write_count":sum(v["counts"]["write"] for v in receiver_write_reports.values()),
-  "receiver_lea_count":sum(v["counts"]["lea"] for v in receiver_write_reports.values()),
-  "recommended_next_step":
-   "If direct receiver writes are found, inspect writer contexts to identify initialization. If no direct writes are found, treat the receiver as runtime/framework state and pivot to a minimal read-only runtime repository dump rather than deeper static producer disassembly."
- }
-
- summary={"version":MASTER_VERSION,"architecture":"standalone-no-wrapper","analysis_mode":"journal-to-repository-consumer",
-          "exe_sha256":h,"token_results":[{"token":x["token"],"hits":len(x["hits"]),"registrations":len(x["registrations"]),
-                                          "native_rvas":[r["native_rva_hex"] for r in x["registrations"]]} for x in token_rows],
-          "journal_root_rva_hex":f"0x{JOURNAL_ROOT:X}","known_repo_consumer_rva_hex":f"0x{KNOWN_REPO_CONSUMER:X}",
-          "assessment":assessment}
- savej(out/"master_summary.json",summary)
- savej(out/"script_token_map.json",token_rows)
- savej(out/"journal_region_repo_callers.json",repo_callers)
- savej(out/"get_unique_repo_struct_native_nodes.json",repo_nodes)
- savej(out/"repo_consumer.json",repo)
- savej(out/"repo_consumer_graph.json",repo_graph)
- savej(out/"repo_consumer_callers.json",repo_callers)
- savej(out/"journal_repo_callsite_windows.json",callsite_windows)
- savej(out/"repository_consumer_compare.json",consumer_compare)
- savej(out/"repository_consumer_shared_refs.json",{"common_all":common_refs,"pairwise":pairwise_refs})
- savej(out/"repository_selector_descriptors.json",descriptor_rows)
- savej(out/"repository_selector_names.json",named_ptrs)
- savej(out/"repository_exact_descriptor_labels.json",exact_labels)
- savej(out/"repository_rip_ref_instruction_windows.json",ref_windows)
- savej(out/"repository_variable_access_protocols.json",variable_accesses)
- savej(out/"repository_variable_access_flows.json",variable_access_flows)
- savej(out/"repository_receiver_global_xrefs.json",receiver_xrefs)
- savej(out/"repository_receiver_write_scan.json",receiver_write_reports)
- savej(out/"repository_receiver_writer_contexts.json",receiver_writer_contexts)
- savej(out/"strategy_assessment.json",assessment)
-
- with (out/"script_token_map.csv").open("w",newline="",encoding="utf-8-sig") as f:
-  w=csv.DictWriter(f,fieldnames=["token","hits","registrations","native_rvas"]);w.writeheader()
-  for x in token_rows:w.writerow({"token":x["token"],"hits":len(x["hits"]),"registrations":len(x["registrations"]),
-                                  "native_rvas":";".join(r["native_rva_hex"] for r in x["registrations"])})
- with (out/"repo_consumer_callers.csv").open("w",newline="",encoding="utf-8-sig") as f:
-  w=csv.DictWriter(f,fieldnames=["caller_rva_hex","size","call_sites"]);w.writeheader()
-  for x in repo_callers:w.writerow({"caller_rva_hex":x["caller_rva_hex"],"size":x["size"],"call_sites":";".join(x["call_sites"])})
-
+ pid=find_process()
+ if pid is None:
+  status={"version":MASTER_VERSION,"exe_sha256":h,"runtime_status":"game-not-running","instruction":"Start Hero Siege, wait until the main menu or character is loaded, then run Master again."};savej(out/"runtime_probe.json",status)
+  if zp.exists():zp.unlink()
+  with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:z.write(out/"runtime_probe.json","runtime_probe.json")
+  print("Hero_Siege.exe is not running.",flush=True);print("Start the game, wait until the main menu or character is loaded, then run Master again.",flush=True);print("Done:",zp);print("Master:",MASTER_VERSION);return
+ mod=module_base(pid)
+ if not mod:raise SystemExit("Hero_Siege.exe module base not found.")
+ base,mod_size,mod_path=mod;print("Runtime PID:",pid,flush=True);print("Module base:",hx(base),flush=True);print("Module size:",hx(mod_size),flush=True)
+ r=Reader(pid)
+ try:
+  root_slot=base+ROOT_RVA;root_ptr=r.u64(root_slot);print("Root slot:",hx(root_slot),flush=True);print("Root pointer:",hx(root_ptr),flush=True)
+  desc=[]
+  for name,rva in DESCRIPTORS.items():
+   addr=base+rva;b=r.read(addr,16);rec={"name":name,"rva_hex":hx(rva),"address_hex":hx(addr),"bytes_hex":b.hex(" ") if b else None}
+   if b and len(b)>=16:rec["runtime_cache_u64"]=struct.unpack_from("<Q",b,0)[0];rec["runtime_cache_u32"]=struct.unpack_from("<I",b,0)[0];rec["name_pointer_hex"]=hx(struct.unpack_from("<Q",b,8)[0])
+   desc.append(rec)
+  root_blob=r.read(root_ptr,0x400) if root_ptr else None;root_info={"slot_rva_hex":hx(ROOT_RVA),"slot_address_hex":hx(root_slot),"root_pointer_hex":hx(root_ptr),"root_pointer_class":ptr_class(root_ptr,base,mod_size)}
+  if root_blob:
+   root_info["root_bytes_hex"]=root_blob.hex(" ");root_info["root_pointer_samples"]=pointer_samples(r,root_blob,base,mod_size,root_ptr,96);vtable=struct.unpack_from("<Q",root_blob,0)[0];root_info["vtable_pointer_hex"]=hx(vtable);root_info["vtable_class"]=ptr_class(vtable,base,mod_size)
+   if base<=vtable<base+mod_size:root_info["vtable_rva_hex"]=hx(vtable-base)
+   vt=r.read(vtable,0x100) if vtable else None
+   if vt:
+    root_info["vtable_bytes_hex"]=vt.hex(" ");root_info["vtable_entries"]=[{"offset":off,"value_hex":hx(struct.unpack_from("<Q",vt,off)[0]),"module_rva_hex":hx(struct.unpack_from("<Q",vt,off)[0]-base) if base<=struct.unpack_from("<Q",vt,off)[0]<base+mod_size else None} for off in range(0,len(vt)-7,8)]
+  adj_start=base+ROOT_RVA-0x200;adj=r.read(adj_start,0x400);adj_info={"start_address_hex":hx(adj_start),"start_rva_hex":hx(ROOT_RVA-0x200),"bytes_hex":adj.hex(" ") if adj else None}
+  if adj:adj_info["pointer_samples"]=pointer_samples(r,adj,base,mod_size,adj_start,96)
+  result={"version":MASTER_VERSION,"exe_sha256":h,"runtime_status":"ok","pid":pid,"module_base_hex":hx(base),"module_size_hex":hx(mod_size),"module_path":mod_path,"root":root_info,"descriptors":desc,"adjacent_globals":adj_info,"mode":"read-only external process memory probe; no injection, no writes"}
+  savej(out/"runtime_probe.json",result);savej(out/"runtime_root.json",root_info);savej(out/"runtime_descriptors.json",desc);savej(out/"runtime_adjacent_globals.json",adj_info)
+ finally:r.close()
  if zp.exists():zp.unlink()
  with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
   for p in out.rglob("*"):
    if p.is_file():z.write(p,p.relative_to(out))
- print("Done:",zp);print("Master:",MASTER_VERSION);print("Mode: journal-to-repository-consumer")
- print("Elapsed: %.1fs"%(time.time()-t0))
-
+ print("Done:",zp);print("Master:",MASTER_VERSION);print("Elapsed: %.1fs"%(time.time()-t))
 if __name__=="__main__":main()
