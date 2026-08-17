@@ -10,9 +10,10 @@ Hero Siege Permanent Master Extractor
 from pathlib import Path
 import argparse,csv,hashlib,json,math,shutil,struct,time,zipfile
 from collections import Counter,defaultdict
-MASTER_VERSION="permanent-master-v8-github"
+MASTER_VERSION="permanent-master-v9-github"
 FUNC_BEGIN=0x05856C00;FUNC_END=0x0588E599;DEFINE_INIT=0x04FF54F0
 PREP=0x0C54E830;TARGET=0x0C579810;ITEM_HELPER=0x058A48A0;VALUE_HELPER=0x56710;CLEANUP=0x56560;FIELD_CONSUMER_HELPER=0x0C566890;FIELD_CONSUMER_INNER=0x0C534390
+FIELD_CONSUMER_TAIL_COMMON=0x0C566950;FIELD_CONSUMER_TAIL_SPECIAL=0x0C565E60
 PRIMARY_SEGMENTS=list(range(2,71,2));KNOWN_SEGMENTS={8:"Godfather",20:"Thor",40:"Genji"}
 KNOWN_EXPECTED={"Godfather":{"target_subsequence":[13315,1424,11],"identity_candidate":1855},"Thor":{"target_subsequence":[8860,1424,83],"identity_candidate":16155},"Genji":{"target_subsequence":[8866,1424,78],"identity_candidate":29455}}
 DEFAULT_RULES={"version":2,"identity_fields":["0x100","0x1D0"],"fingerprint":{"use_target_head":False,"target_head_length":4,"numeric_local_fields":["0x1D0"]},"auto_tune":{"enabled":True,"max_fields":4,"min_coverage":10,"prefer_full_coverage":True}}
@@ -180,16 +181,17 @@ def analyze_named_helper(pe,rows,target=FIELD_CONSUMER_HELPER):
     for r in rows:
         ev=scan_block(pe,r['begin'],r['end']);calls=[e for e in ev if e['kind']=='CALL' and e['target']==target];entries=[]
         for c in calls:
-            args=trace_call_args_raw(pe,r['begin'],c['rva']);shape=tuple(None if args[k] is None else (args[k].get('kind'),args[k].get('disp'),args[k].get('src'),args[k].get('double')) for k in ('RCX','RDX','R8','R9'));arg_shape_freq[repr(shape)]+=1;entries.append({'call_rva':c['rva'],'call_rva_hex':f"0x{c['rva']:X}",'args':args,'near_0x100':r.get('local_numeric_values',{}).get('0x100',[]),'canonical_0x1D0':r.get('local_numeric_values',{}).get('0x1D0',[])})
+            args=trace_call_args_raw(pe,r['begin'],c['rva']);shape=tuple(None if args[k] is None else (args[k].get('kind'),args[k].get('src'),args[k].get('disp'),args[k].get('double')) for k in ('RCX','RDX','R8','R9'));arg_shape_freq[repr(shape)]+=1;entries.append({'call_rva':c['rva'],'args':args,'canonical_0x1D0':r['local_numeric_values'].get('0x1D0',[]),'aux_0x100':r['local_numeric_values'].get('0x100',[])})
         out.append({'candidate_ordinal':r['candidate_ordinal'],'segment_index':r['segment_index'],'known_name':r['known_name'],'calls':entries})
-    return {'target':target,'target_hex':f'0x{target:X}','total_calls':sum(len(x['calls']) for x in out),'arg_shape_frequency':[{'shape':k,'count':v} for k,v in arg_shape_freq.most_common()],'per_block':out}
+    return {'target':target,'target_hex':f'0x{target:X}','total_calls':sum(len(x['calls']) for x in out),'arg_shape_frequency':[{'shape':s,'count':c} for s,c in arg_shape_freq.most_common()],'blocks':out}
 def analyze_absolute_rva_switch(pe,function_rva,entry_count=16):
     bounds=pe.pdata_function_containing(function_rva)
     if not bounds:return {'found':False,'reason':'no_pdata_bounds','rva_hex':f'0x{function_rva:X}'}
     a,z=bounds['begin'],bounds['end'];b=pe.get(a,z);candidates=[]
     for i in range(0,max(0,len(b)-entry_count*4+1)):
         vals=[u32(b,i+j*4) for j in range(entry_count)]
-        if all(a<=v<z for v in vals):candidates.append(((entry_count-len(set(vals)))*1000+i,i,vals))
+        if all(a<=v<z for v in vals):
+            distinct=len(set(vals));score=(entry_count-distinct)*1000+i;candidates.append((score,i,vals))
     if not candidates:return {'found':False,'reason':'no_absolute_rva_table','function':{**bounds,'begin_hex':f'0x{a:X}','end_hex':f'0x{z:X}'}}
     _,off,vals=max(candidates);table_rva=a+off;freq=Counter(vals)
     return {'found':True,'function':{**bounds,'begin_hex':f'0x{a:X}','end_hex':f'0x{z:X}'},'jump_table':{'table_rva':table_rva,'table_rva_hex':f'0x{table_rva:X}','entries':vals,'distinct_targets':len(freq)},'cases':[{'index':i,'target':v,'target_hex':f'0x{v:X}'} for i,v in enumerate(vals)],'case_target_frequency':[{'target':t,'target_hex':f'0x{t:X}','count':c} for t,c in freq.most_common()]}
@@ -198,8 +200,37 @@ def analyze_helper_call_windows(pe,rows,helper_rva=FIELD_CONSUMER_HELPER):
     for row in rows:
         ev=scan_block(pe,row['begin'],row['end']);calls=[e for e in ev if e['kind']=='CALL' and e['target']==helper_rva]
         for c in calls:
-            rva=c['rva'];raw_begin=max(row['begin'],rva-0x100);raw_end=min(row['end'],rva+0x60);raw=pe.get(raw_begin,raw_end);relevant=[e for e in ev if rva-0x100<=e['rva']<=rva+0x60 and (e.get('disp')==0x100 or e['kind']=='CALL')];before100=[e for e in ev if e.get('disp')==0x100 and e['rva']<rva];after100=[e for e in ev if e.get('disp')==0x100 and e['rva']>rva];args=trace_call_args_raw(pe,row['begin'],rva,window=0x180);r9=args.get('R9');r9_is=bool(r9 and r9.get('kind')=='LEA_RBP' and r9.get('disp')==0x100);summary['calls']+=1;summary['r9_is_lea_0x100' if r9_is else 'r9_other']+=1;result.append({'candidate_ordinal':row['candidate_ordinal'],'segment_index':row['segment_index'],'known_name':row['known_name'],'call_rva':rva,'call_rva_hex':f'0x{rva:X}','args':args,'r9_is_lea_rbp_0x100':r9_is,'canonical_0x1D0':row['local_numeric_values'].get('0x1D0',[]),'aux_0x100':row['local_numeric_values'].get('0x100',[]),'nearest_0x100_event_before_call':before100[-1] if before100 else None,'nearest_0x100_event_after_call':after100[0] if after100 else None,'relevant_events':relevant,'raw_begin':raw_begin,'raw_begin_hex':f'0x{raw_begin:X}','raw_hex':raw.hex(' ')})
+            rva=c['rva'];raw_begin=max(row['begin'],rva-0x100);raw_end=min(row['end'],rva+0x60);raw=pe.get(raw_begin,raw_end);relevant=[]
+            for e in ev:
+                if rva-0x100<=e['rva']<=rva+0x60 and (e.get('disp')==0x100 or e['kind']=='CALL'):relevant.append(e)
+            before100=[e for e in ev if e.get('disp')==0x100 and e['rva']<rva];after100=[e for e in ev if e.get('disp')==0x100 and e['rva']>rva];nearest_before=before100[-1] if before100 else None;nearest_after=after100[0] if after100 else None;args=trace_call_args_raw(pe,row['begin'],rva,window=0x180);r9=args.get('R9');r9_is_0x100=bool(r9 and r9.get('kind')=='LEA_RBP' and r9.get('disp')==0x100);summary['calls']+=1;summary['r9_is_lea_0x100' if r9_is_0x100 else 'r9_other']+=1
+            result.append({'candidate_ordinal':row['candidate_ordinal'],'segment_index':row['segment_index'],'known_name':row['known_name'],'call_rva':rva,'call_rva_hex':f'0x{rva:X}','args':args,'r9_is_lea_rbp_0x100':r9_is_0x100,'canonical_0x1D0':row['local_numeric_values'].get('0x1D0',[]),'aux_0x100':row['local_numeric_values'].get('0x100',[]),'nearest_0x100_event_before_call':nearest_before,'nearest_0x100_event_after_call':nearest_after,'relevant_events':relevant,'raw_begin':raw_begin,'raw_begin_hex':f'0x{raw_begin:X}','raw_hex':raw.hex(' ')})
     return {'helper_rva':helper_rva,'helper_rva_hex':f'0x{helper_rva:X}','summary':dict(summary),'calls':result}
+def trace_register_origin_raw(pe,begin,call_rva,reg_name='RDI',window=0x240):
+    a=max(begin,call_rva-window);b=pe.get(a,call_rva);events=[];base_regs=['RAX','RCX','RDX','RBX','RSP','RBP','RSI','RDI'];ext_regs=['R8','R9','R10','R11','R12','R13','R14','R15'];i=0
+    while i<len(b):
+        r=a+i
+        if i+10<=len(b) and b[i] in (0x48,0x49) and 0xB8<=b[i+1]<=0xBF:
+            idx=b[i+1]-0xB8;reg=(ext_regs if (b[i]&1) else base_regs)[idx];q=u64(b,i+2);events.append({'rva':r,'kind':'IMM','dst':reg,'qword':q,'double':finite_double(q)});i+=10;continue
+        if i+3<=len(b) and 0x40<=b[i]<=0x4F and b[i+1] in (0x89,0x8B,0x8D):
+            rex=b[i];op=b[i+1];m=b[i+2];mod=(m>>6)&3;rr=(m>>3)&7;rm=m&7;reg=(ext_regs if (rex&4) else base_regs)[rr];rmreg=(ext_regs if (rex&1) else base_regs)[rm]
+            if mod==3 and op in (0x89,0x8B):
+                dst,source=(rmreg,reg) if op==0x89 else (reg,rmreg);events.append({'rva':r,'kind':'MOV_REG','dst':dst,'src':source});i+=3;continue
+            if mod==2 and rm==5 and i+7<=len(b):
+                disp=s32(b,i+3);events.append({'rva':r,'kind':'LOAD_RBP' if op==0x8B else 'LEA_RBP','dst':reg,'disp':disp});i+=7;continue
+        i+=1
+    xs=[e for e in events if e.get('dst')==reg_name];return xs[-1] if xs else None
+def analyze_0x100_lifecycle(pe,rows):
+    records=[];stat=Counter()
+    for row in rows:
+        ev=scan_block(pe,row['begin'],row['end']);helper_calls=[e for e in ev if e['kind']=='CALL' and e['target']==FIELD_CONSUMER_HELPER]
+        for call in helper_calls:
+            r=call['rva'];prior=[e for e in ev if e.get('disp')==0x100 and e['rva']<r];later=[e for e in ev if e.get('disp')==0x100 and e['rva']>r];p=prior[-1] if prior else None;n=later[0] if later else None;args=trace_call_args_raw(pe,row['begin'],r,window=0x180);rdi_origin=trace_register_origin_raw(pe,row['begin'],r,'RDI',window=0x300);rec={'candidate_ordinal':row['candidate_ordinal'],'segment_index':row['segment_index'],'known_name':row['known_name'],'call_rva':r,'call_rva_hex':f'0x{r:X}','aux_0x100':row['local_numeric_values'].get('0x100',[]),'prior_0x100_event':p,'prior_delta':(r-p['rva']) if p else None,'next_0x100_event':n,'next_delta':(n['rva']-r) if n else None,'args':args,'rdi_origin':rdi_origin};records.append(rec);stat['calls']+=1
+            if p and p['kind']=='STORE_REG64_RBP':stat['preinitialized_before_call']+=1
+            if p and p.get('double') is not None:stat['numeric_preinitialized_before_call']+=1
+            if n:stat['has_later_0x100_event']+=1
+            if args.get('R9') and args['R9'].get('kind')=='LEA_RBP' and args['R9'].get('disp')==0x100:stat['passes_address_in_R9']+=1
+    return {'summary':dict(stat),'known':[x for x in records if x['known_name']],'records':records}
 def analyze_helper_semantic_flow(pe):
     bounds=pe.pdata_function_containing(FIELD_CONSUMER_HELPER)
     if not bounds:return {'found':False}
@@ -210,7 +241,7 @@ def analyze_helper_semantic_flow(pe):
             t=(r+5+s32(b,i+1))&0xffffffff;calls.append({'rva':r,'rva_hex':f'0x{r:X}','target':t,'target_hex':f'0x{t:X}'})
         elif b[i]==0xE9:
             t=(r+5+s32(b,i+1))&0xffffffff;tails.append({'rva':r,'rva_hex':f'0x{r:X}','target':t,'target_hex':f'0x{t:X}'})
-    return {'found':True,'function':{**bounds,'begin_hex':f'0x{a:X}','end_hex':f"0x{bounds['end']:X}"},'observed_prologue_flow':{'reads_tag_from':'[RCX+0x0C]','preserves_incoming_R9_in':'RBX','preserves_incoming_R8D_in':'EDI','preserves_incoming_EDX_in':'ESI','common_path_calls':'0xC534390','after_common_call':['R9 <- preserved incoming R9','R8D <- preserved incoming R8D','EDX <- preserved incoming EDX','ECX <- EAX returned by 0xC534390']},'direct_calls':calls,'tail_jumps':tails}
+    return {'found':True,'function':{**bounds,'begin_hex':f'0x{a:X}','end_hex':f'0x{bounds["end"]:X}'},'observed_prologue_flow':{'reads_tag_from':'[RCX+0x0C]','preserves_incoming_R9_in':'RBX','preserves_incoming_R8D_in':'EDI','preserves_incoming_EDX_in':'ESI','common_path_calls':'0xC534390','after_common_call':['R9 <- preserved incoming R9','R8D <- preserved incoming R8D','EDX <- preserved incoming EDX','ECX <- EAX returned by 0xC534390']},'direct_calls':calls,'tail_jumps':tails}
 def analyze_function_deep(pe,rva):
     bounds=pe.pdata_function_containing(rva)
     if not bounds:return {'rva':rva,'rva_hex':f'0x{rva:X}','bounds_found':False}
@@ -221,81 +252,86 @@ def analyze_function_deep(pe,rva):
             t=(cur+5+s32(b,i+1))&0xffffffff;calls.append({'rva':cur,'rva_hex':f'0x{cur:X}','target':t,'target_hex':f'0x{t:X}'});i+=5;continue
         if i+5<=len(b) and b[i]==0xE9:
             t=(cur+5+s32(b,i+1))&0xffffffff;tails.append({'rva':cur,'rva_hex':f'0x{cur:X}','target':t,'target_hex':f'0x{t:X}'});i+=5;continue
+        if i+7<=len(b) and 0x40<=b[i]<=0x4F and b[i+1] in (0x8B,0x8D):
+            m=b[i+2]
+            if (m&0xC7)==0x05:
+                t=(cur+7+s32(b,i+3))&0xffffffff;rip.append({'rva':cur,'rva_hex':f'0x{cur:X}','kind':'LEA' if b[i+1]==0x8D else 'LOAD','target':t,'target_hex':f'0x{t:X}'});i+=7;continue
         i+=1
-    return {'rva':rva,'rva_hex':f'0x{rva:X}','bounds_found':True,'function':{**bounds,'begin_hex':f'0x{a:X}','end_hex':f'0x{z:X}'},'direct_calls':calls,'direct_call_frequency':[{'target':t,'target_hex':f'0x{t:X}','count':c} for t,c in Counter(x['target'] for x in calls).most_common()],'tail_jumps':tails,'tail_jump_frequency':[{'target':t,'target_hex':f'0x{t:X}','count':c} for t,c in Counter(x['target'] for x in tails).most_common()],'rip_refs':rip,'raw':b.hex(' ')}
+    return {'rva':rva,'rva_hex':f'0x{rva:X}','bounds_found':True,'function':{**bounds,'begin_hex':f'0x{a:X}','end_hex':f'0x{z:X}'},'direct_calls':calls,'direct_call_frequency':[{'target':t,'target_hex':f'0x{t:X}','count':c} for t,c in Counter(x['target'] for x in calls).most_common()],'tail_jumps':tails,'tail_jump_frequency':[{'target':t,'target_hex':f'0x{t:X}','count':c} for t,c in Counter(x['target'] for x in tails).most_common()],'rip_refs':rip,'raw_prefix':b[:512].hex(' '),'raw_suffix':b[-512:].hex(' ') if len(b)>512 else b.hex(' ')}
 def analyze_helper_body(pe,helper_rva=FIELD_CONSUMER_HELPER):
     bounds=pe.pdata_function_containing(helper_rva)
-    if not bounds:return {'bounds_found':False}
-    a,z=bounds['begin'],bounds['end'];b=pe.get(a,z);calls=[]
-    for i in range(len(b)-4):
-        if b[i]==0xE8:
-            r=a+i;t=(r+5+s32(b,i+1))&0xffffffff;calls.append({'rva':r,'target':t,'target_hex':f'0x{t:X}'})
-    return {'bounds_found':True,'function':{**bounds,'begin_hex':f'0x{a:X}','end_hex':f'0x{z:X}'},'direct_calls':calls,'direct_call_frequency':[{'target':t,'target_hex':f'0x{t:X}','count':c} for t,c in Counter(x['target'] for x in calls).most_common()],'raw':b.hex(' ')}
-def analyze_field_consumers(rows,fields=('0x100','0x1D0')):
-    out={}
-    for field in fields:
-        first=Counter();per=[]
+    if not bounds:return {'helper_rva':helper_rva,'helper_hex':f'0x{helper_rva:X}','bounds_found':False}
+    a,z=bounds['begin'],bounds['end'];b=pe.get(a,z);calls=[];call_freq=Counter();rip_refs=[];i=0
+    while i<len(b):
+        r=a+i
+        if i+5<=len(b) and b[i]==0xE8:
+            t=(r+5+s32(b,i+1))&0xffffffff;calls.append({'rva':r,'rva_hex':f'0x{r:X}','target':t,'target_hex':f'0x{t:X}'});call_freq[t]+=1;i+=5;continue
+        if i+7<=len(b) and 0x40<=b[i]<=0x4F and b[i+1] in (0x8B,0x8D):
+            m=b[i+2]
+            if (m&0xC7)==0x05:
+                t=r+7+s32(b,i+3);rip_refs.append({'rva':r,'rva_hex':f'0x{r:X}','kind':'RIP_LEA' if b[i+1]==0x8D else 'RIP_LOAD','target':t,'target_hex':f'0x{t:X}','raw':b[i:i+7].hex(' ')});i+=7;continue
+        if i+6<=len(b) and b[i] in (0x8B,0x8D):
+            m=b[i+1]
+            if (m&0xC7)==0x05:
+                t=r+6+s32(b,i+2);rip_refs.append({'rva':r,'rva_hex':f'0x{r:X}','kind':'RIP_LEA32' if b[i]==0x8D else 'RIP_LOAD32','target':t,'target_hex':f'0x{t:X}','raw':b[i:i+6].hex(' ')});i+=6;continue
+        i+=1
+    return {'helper_rva':helper_rva,'helper_hex':f'0x{helper_rva:X}','bounds_found':True,'function':{**bounds,'begin_hex':f'0x{a:X}','end_hex':f'0x{z:X}'},'direct_calls':calls,'direct_call_frequency':[{'target':t,'target_hex':f'0x{t:X}','count':c} for t,c in call_freq.most_common()],'rip_refs':rip_refs,'raw_prefix':b[:256].hex(' '),'raw_suffix':b[-256:].hex(' ') if len(b)>256 else b.hex(' ')}
+def survey_local_fields(rows):
+    all_disps=sorted({k for r in rows for k in r['local_numeric_values']});out=[]
+    for d in all_disps:
+        vals=[]
         for r in rows:
-            life=r.get('identity_lifecycle',{}).get(field,[]);entries=[]
-            for x in life:
-                after=x.get('nearby_calls',{}).get('after',[])
-                if after:first[after[0]['target']]+=1
-                entries.append(x)
-            per.append({'candidate_ordinal':r['candidate_ordinal'],'known_name':r['known_name'],'field_values':r.get('local_numeric_values',{}).get(field,[]),'events':entries})
-        out[field]={'first_after_target_frequency':[{'target':t,'target_hex':f'0x{t:X}','count':c} for t,c in first.most_common()],'per_block':per}
-    return out
-def survey_local_discriminators(rows):
-    mp=defaultdict(dict)
-    for r in rows:
-        for d,v in r['local_numeric_values'].items():mp[d][r['candidate_ordinal']]=tuple(v)
+            v=r['local_numeric_values'].get(d,[]);vals.append(tuple(v)) if v else None
+        covered=[tuple(r['local_numeric_values'][d]) for r in rows if d in r['local_numeric_values']];freq=Counter(covered);out.append({'disp':d,'coverage':len(covered),'distinct':len(freq),'collision_count':sum(1 for _,c in freq.items() if c>1),'collisions':[{'value':list(k),'count':c} for k,c in freq.items() if c>1]})
+    out.sort(key=lambda x:(-x['coverage'],-x['distinct'],x['collision_count'],x['disp']));return out
+def fingerprint_for_row(row,rules):
+    vals=[]
+    if rules['fingerprint'].get('use_target_head'):vals.append(['target_head',row['structural_target_head']])
+    for d in rules['fingerprint'].get('numeric_local_fields',[]):vals.append([d,row['local_numeric_values'].get(d,[])])
+    return vals
+def canonical_records(rows,rules):
     out=[]
-    for d,bm in mp.items():
-        g=defaultdict(list)
-        for o,v in bm.items():g[v].append(o)
-        out.append({'disp':d,'coverage':len(bm),'distinct_signatures':len(g),'collision_group_count':sum(len(x)>1 for x in g.values())})
-    return sorted(out,key=lambda x:(-x['coverage'],-x['distinct_signatures'],x['collision_group_count']))
-def make_fingerprint(row,rules):
-    fp=[]
-    if rules['fingerprint'].get('use_target_head',True):fp+=['TARGET_HEAD']+row['structural_target_head']
-    for d in rules['fingerprint'].get('numeric_local_fields',[]):fp+=[f'RBP:{d}']+row['local_numeric_values'].get(d,[])
-    return fp
-def apply_fingerprints(rows,rules):
-    g=defaultdict(list)
-    for r in rows:r['fingerprint']=make_fingerprint(r,rules);g[tuple(r['fingerprint'])].append(r['candidate_ordinal'])
-    return [{'fingerprint':list(k),'ordinals':v} for k,v in g.items() if len(v)>1]
-def auto_tune_rules(rows,rules,survey):return rules,{'changed':False,'reason':'canonical_0x1D0'}
+    for r in rows:
+        out.append({'candidate_ordinal':r['candidate_ordinal'],'segment_index':r['segment_index'],'known_name':r['known_name'],'fingerprint':fingerprint_for_row(r,rules),'local_0x100':r['local_numeric_values'].get('0x100',[]),'local_0x1D0':r['local_numeric_values'].get('0x1D0',[]),'target_payload_values':r['target_payload_values']})
+    return out
+def collision_report(canon):
+    groups=defaultdict(list)
+    for r in canon:groups[json.dumps(r['fingerprint'],sort_keys=True)].append(r)
+    return [{'fingerprint':json.loads(k),'records':[{'candidate_ordinal':x['candidate_ordinal'],'segment_index':x['segment_index'],'known_name':x['known_name']} for x in v]} for k,v in groups.items() if len(v)>1]
 def validate_known(rows):
     out=[]
     for r in rows:
-        n=r.get('known_name')
-        if not n:continue
-        exp=KNOWN_EXPECTED[n];p=[x for x in r['target_payload_values'] if x is not None];ids=r['local_numeric_values'].get('0x100',[]);out.append({'name':n,'overall_ok':contains_subsequence(p,exp['target_subsequence']) and exp['identity_candidate'] in ids})
+        name=r['known_name']
+        if not name:continue
+        ex=KNOWN_EXPECTED[name];sub_ok=contains_subsequence(r['target_payload_values'],ex['target_subsequence']);aux=r['local_numeric_values'].get('0x100',[]);aux_ok=ex['identity_candidate'] in aux;out.append({'name':name,'segment_index':r['segment_index'],'candidate_ordinal':r['candidate_ordinal'],'target_subsequence_ok':sub_ok,'identity_candidate_ok':aux_ok,'overall_ok':sub_ok and aux_ok})
     return out
-def load_cache(path):return load_json(path,{'version':1,'exe_sha256':None,'calls':None,'preps':None,'segments':None})
-def save_cache(path,h,calls,preps,segments):save_json(path,{'version':1,'exe_sha256':h,'calls':calls,'preps':preps,'segments':segments})
+def load_cache(path):
+    try:return json.loads(path.read_text(encoding='utf-8'))
+    except:return {}
 def write_csv(path,rows):
+    cols=['candidate_ordinal','segment_index','known_name','begin','end','size','call_count','target_count','item_helper_count','value_helper_count','cleanup_count','structural_target_head','target_payload_values','local_0x100','local_0x1D0']
     with path.open('w',newline='',encoding='utf-8-sig') as f:
-        w=csv.writer(f);w.writerow(['ordinal','segment','known','0x1D0','0x100','TARGET'])
-        for r in rows:w.writerow([r['candidate_ordinal'],r['segment_index'],r['known_name'] or '',json.dumps(r['local_numeric_values'].get('0x1D0',[])),json.dumps(r['local_numeric_values'].get('0x100',[])),json.dumps(r['target_payload_values'])])
-def zip_dir(src,zpath):
-    if zpath.exists():zpath.unlink()
-    with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED) as z:
+        w=csv.DictWriter(f,fieldnames=cols);w.writeheader()
+        for r in rows:w.writerow({'candidate_ordinal':r['candidate_ordinal'],'segment_index':r['segment_index'],'known_name':r['known_name'] or '','begin':f"0x{r['begin']:X}",'end':f"0x{r['end']:X}",'size':r['size'],'call_count':r['call_count'],'target_count':r['target_count'],'item_helper_count':r['item_helper_count'],'value_helper_count':r['value_helper_count'],'cleanup_count':r['cleanup_count'],'structural_target_head':json.dumps(r['structural_target_head']),'target_payload_values':json.dumps(r['target_payload_values']),'local_0x100':json.dumps(r['local_numeric_values'].get('0x100',[])),'local_0x1D0':json.dumps(r['local_numeric_values'].get('0x1D0',[]))})
+def zip_dir(src,zip_path):
+    if zip_path.exists():zip_path.unlink()
+    with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED) as z:
         for p in src.rglob('*'):
             if p.is_file():z.write(p,p.relative_to(src))
 def main():
     t0=time.time();ap=argparse.ArgumentParser();ap.add_argument('hero_siege_dir');args=ap.parse_args();root=Path(args.hero_siege_dir).resolve();exe=choose_exe(root);desk=desktop();out=desk/'hero_siege_master';zip_path=desk/'hero_siege_master.zip';state=desk/'hero_siege_master_state';rules_path=state/'rules.json';cache_path=state/'cache.json';history_path=state/'rules_history.jsonl';state.mkdir(parents=True,exist_ok=True)
     if out.exists():shutil.rmtree(out)
     out.mkdir(parents=True);rules=load_json(rules_path,DEFAULT_RULES);rules,migration_info=migrate_rules_to_v2(rules)
+    if migration_info['changed']:save_json(rules_path,rules);append_jsonl(history_path,{'timestamp':time.strftime('%Y-%m-%d %H:%M:%S'),'event':'rules_migration','master_version':MASTER_VERSION,'migration':migration_info})
     exe_hash=sha256(exe);cache=load_cache(cache_path);pe=PE(exe);cache_hit=cache.get('exe_sha256')==exe_hash and cache.get('calls') and cache.get('preps') and cache.get('segments')
     if cache_hit:
         calls=cache['calls'];preps=cache['preps'];segments=cache['segments'];calls_by_target=defaultdict(list)
         for c in calls:calls_by_target[int(c['target'])].append(int(c['rva']))
     else:
-        calls,calls_by_target=build_direct_calls(pe,FUNC_BEGIN,FUNC_END);preps,segments=build_prep_segments(calls);save_cache(cache_path,exe_hash,calls,preps,segments)
-    rows=extract_primary_blocks(pe,preps,rules);survey=survey_local_discriminators(rows);consumer_analysis=analyze_field_consumers(rows);named_helper_analysis=analyze_named_helper(pe,rows);helper_body_analysis=analyze_helper_body(pe);switch_dispatch_analysis=analyze_absolute_rva_switch(pe,FIELD_CONSUMER_HELPER);inner_helper_analysis=analyze_function_deep(pe,FIELD_CONSUMER_INNER);inner_switch_analysis=analyze_absolute_rva_switch(pe,FIELD_CONSUMER_INNER);helper_call_windows=analyze_helper_call_windows(pe,rows);helper_semantic_flow=analyze_helper_semantic_flow(pe);final_collisions=apply_fingerprints(rows,rules);validation=validate_known(rows)
-    groups=defaultdict(list)
-    for r in rows:groups[tuple(r['local_numeric_values'].get('0x1D0',[]))].append(r['candidate_ordinal'])
-    summary={'version':MASTER_VERSION,'exe_sha256':exe_hash,'primary_candidate_count':len(rows),'canonical_0x1D0':{'coverage':sum(bool(r['local_numeric_values'].get('0x1D0')) for r in rows),'distinct':len(groups),'collision_count':sum(len(v)>1 for v in groups.values())},'known_validation':validation,'helper_switch':switch_dispatch_analysis,'inner_switch':inner_switch_analysis,'helper_call_window_summary':helper_call_windows['summary'],'helper_semantic_flow':helper_semantic_flow,'helper_calls':helper_body_analysis.get('direct_call_frequency',[]),'inner_calls':inner_helper_analysis.get('direct_call_frequency',[])}
-    save_json(out/'master_summary.json',summary);save_json(out/'canonical_records.json',rows);save_json(out/'canonical_record_collisions.json',final_collisions);save_json(out/'consumer_helper_0xC566890_body.json',helper_body_analysis);save_json(out/'consumer_helper_0xC566890_switch.json',switch_dispatch_analysis);save_json(out/'consumer_inner_0xC534390.json',inner_helper_analysis);save_json(out/'consumer_inner_0xC534390_switch.json',inner_switch_analysis);save_json(out/'consumer_helper_call_windows.json',helper_call_windows);save_json(out/'consumer_helper_semantic_flow.json',helper_semantic_flow);save_json(out/'field_consumer_analysis.json',consumer_analysis);save_json(out/'consumer_helper_0xC566890.json',named_helper_analysis);write_csv(out/'primary_blocks.csv',rows)
-    diag=[f'Hero Siege Master {MASTER_VERSION}',f'Primary blocks: {len(rows)}',f'Canonical 0x1D0: {len(groups)} distinct',f'helper call windows: {helper_call_windows["summary"]}',f'helper tails: {helper_semantic_flow.get("tail_jumps",[])}','Validation:']+[f"  {v['name']}: {'OK' if v['overall_ok'] else 'CHECK'}" for v in validation];(out/'diagnostics.txt').write_text('\n'.join(diag),encoding='utf-8');zip_dir(out,zip_path);print('\n'.join(diag));print('ZIP:',zip_path)
+        calls,calls_by_target=build_direct_calls(pe,FUNC_BEGIN,FUNC_END);preps,segments=build_prep_segments(calls);save_json(cache_path,{'exe_sha256':exe_hash,'func_begin':FUNC_BEGIN,'func_end':FUNC_END,'calls':calls,'preps':preps,'segments':segments})
+    rows=extract_primary_blocks(pe,preps,rules);survey=survey_local_fields(rows);canon=canonical_records(rows,rules);collisions=collision_report(canon);known=validate_known(rows);named_helper_analysis=analyze_named_helper(pe,rows);helper_body_analysis=analyze_helper_body(pe);switch_dispatch_analysis=analyze_absolute_rva_switch(pe,FIELD_CONSUMER_HELPER);inner_helper_analysis=analyze_function_deep(pe,FIELD_CONSUMER_INNER);inner_switch_analysis=analyze_absolute_rva_switch(pe,FIELD_CONSUMER_INNER);helper_call_windows=analyze_helper_call_windows(pe,rows);helper_semantic_flow=analyze_helper_semantic_flow(pe);aux_0x100_lifecycle=analyze_0x100_lifecycle(pe,rows);tail_common_analysis=analyze_function_deep(pe,FIELD_CONSUMER_TAIL_COMMON);tail_special_analysis=analyze_function_deep(pe,FIELD_CONSUMER_TAIL_SPECIAL);tail_common_switch=analyze_absolute_rva_switch(pe,FIELD_CONSUMER_TAIL_COMMON);tail_special_switch=analyze_absolute_rva_switch(pe,FIELD_CONSUMER_TAIL_SPECIAL)
+    canonical_0x1d0=next((x for x in survey if x['disp']=='0x1D0'),None)
+    summary={'version':MASTER_VERSION,'exe_sha256':exe_hash,'primary_candidate_count':len(rows),'canonical_0x1D0':canonical_0x1d0,'known_validation':known,'helper_switch':switch_dispatch_analysis,'inner_switch':inner_switch_analysis,'helper_call_window_summary':helper_call_windows.get('summary',{}),'helper_semantic_flow':helper_semantic_flow,'aux_0x100_lifecycle_summary':aux_0x100_lifecycle.get('summary',{}),'tail_common_summary':{'function':tail_common_analysis.get('function'),'direct_call_frequency':tail_common_analysis.get('direct_call_frequency',[])[:30],'tail_jump_frequency':tail_common_analysis.get('tail_jump_frequency',[])[:30],'switch':tail_common_switch.get('jump_table')},'tail_special_summary':{'function':tail_special_analysis.get('function'),'direct_call_frequency':tail_special_analysis.get('direct_call_frequency',[])[:30],'tail_jump_frequency':tail_special_analysis.get('tail_jump_frequency',[])[:30],'switch':tail_special_switch.get('jump_table')}}
+    save_json(out/'master_summary.json',summary);save_json(out/'canonical_records.json',canon);save_json(out/'canonical_record_collisions.json',collisions);save_json(out/'local_discriminator_survey.json',survey);save_json(out/'consumer_helper_0xC566890.json',named_helper_analysis);save_json(out/'consumer_helper_0xC566890_body.json',helper_body_analysis);save_json(out/'consumer_helper_0xC566890_switch.json',switch_dispatch_analysis);save_json(out/'consumer_inner_0xC534390.json',inner_helper_analysis);save_json(out/'consumer_inner_0xC534390_switch.json',inner_switch_analysis);save_json(out/'consumer_helper_call_windows.json',helper_call_windows);save_json(out/'consumer_helper_semantic_flow.json',helper_semantic_flow);save_json(out/'consumer_aux_0x100_lifecycle.json',aux_0x100_lifecycle);save_json(out/'consumer_tail_0xC566950.json',tail_common_analysis);save_json(out/'consumer_tail_0xC565E60.json',tail_special_analysis);save_json(out/'consumer_tail_0xC566950_switch.json',tail_common_switch);save_json(out/'consumer_tail_0xC565E60_switch.json',tail_special_switch);write_csv(out/'primary_blocks.csv',rows)
+    diag=[];diag.append(f'MASTER_VERSION={MASTER_VERSION}');diag.append(f'EXE={exe}');diag.append(f'EXE_SHA256={exe_hash}');diag.append(f'CACHE_HIT={bool(cache_hit)}');diag.append(f'DIRECT_CALLS={len(calls)}');diag.append(f'PREP_COUNT={len(preps)}');diag.append(f'PRIMARY_CANDIDATES={len(rows)}');diag.append(f'CANONICAL_0x1D0={canonical_0x1d0}');diag.append(f'COLLISIONS={len(collisions)}');diag.append('KNOWN='+repr(known));diag.append('HELPER_SWITCH='+repr(switch_dispatch_analysis.get('case_target_frequency',[])));diag.append('INNER_SWITCH='+repr(inner_switch_analysis.get('case_target_frequency',[])));diag.append('HELPER_CALL_WINDOWS='+repr(helper_call_windows.get('summary',{})));diag.append('AUX_0x100_LIFECYCLE='+repr(aux_0x100_lifecycle.get('summary',{})));diag.append('TAIL_COMMON_CALLS='+repr(tail_common_analysis.get('direct_call_frequency',[])[:20]));diag.append('TAIL_COMMON_TAILS='+repr(tail_common_analysis.get('tail_jump_frequency',[])[:20]));diag.append('TAIL_SPECIAL_CALLS='+repr(tail_special_analysis.get('direct_call_frequency',[])[:20]));diag.append('TAIL_SPECIAL_TAILS='+repr(tail_special_analysis.get('tail_jump_frequency',[])[:20]));(out/'diagnostics.txt').write_text('\n'.join(diag)+'\n',encoding='utf-8');zip_dir(out,zip_path);print(f'Done: {zip_path}');print(f'Master: {MASTER_VERSION}');print(f'Elapsed: {time.time()-t0:.1f}s')
 if __name__=='__main__':main()
