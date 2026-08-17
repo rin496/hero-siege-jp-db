@@ -4,7 +4,7 @@ from pathlib import Path
 import argparse, ctypes, hashlib, json, os, shutil, struct, subprocess, sys, time, zipfile
 from ctypes import wintypes
 
-MASTER_VERSION="permanent-master-v24.1-runtime-probe-clipboard"
+MASTER_VERSION="permanent-master-v24.2-runtime-probe-winapi-fix"
 EXPECTED_SHA="92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4"
 ROOT_RVA=0x11CD4BB8
 DESCRIPTORS={
@@ -43,16 +43,49 @@ def savej(p,x):
 def hx(v): return None if v is None else f"0x{v:X}"
 
 class PROCESSENTRY32W(ctypes.Structure):
- _fields_=[("dwSize",wintypes.DWORD),("cntUsage",wintypes.DWORD),("th32ProcessID",wintypes.DWORD),("th32DefaultHeapID",ctypes.c_size_t),("th32ModuleID",wintypes.DWORD),("cntThreads",wintypes.DWORD),("th32ParentProcessID",wintypes.DWORD),("pcPriClassBase",ctypes.c_long),("dwFlags",wintypes.DWORD),("szExeFile",wintypes.WCHAR*260)]
+ _fields_=[
+  ("dwSize",wintypes.DWORD),("cntUsage",wintypes.DWORD),("th32ProcessID",wintypes.DWORD),
+  ("th32DefaultHeapID",ctypes.c_size_t),("th32ModuleID",wintypes.DWORD),("cntThreads",wintypes.DWORD),
+  ("th32ParentProcessID",wintypes.DWORD),("pcPriClassBase",ctypes.c_long),("dwFlags",wintypes.DWORD),
+  ("szExeFile",wintypes.WCHAR*260)
+ ]
 
 class MODULEENTRY32W(ctypes.Structure):
- _fields_=[("dwSize",wintypes.DWORD),("th32ModuleID",wintypes.DWORD),("th32ProcessID",wintypes.DWORD),("GlblcntUsage",wintypes.DWORD),("ProccntUsage",wintypes.DWORD),("modBaseAddr",ctypes.POINTER(ctypes.c_byte)),("modBaseSize",wintypes.DWORD),("hModule",wintypes.HMODULE),("szModule",wintypes.WCHAR*256),("szExePath",wintypes.WCHAR*260)]
+ _fields_=[
+  ("dwSize",wintypes.DWORD),("th32ModuleID",wintypes.DWORD),("th32ProcessID",wintypes.DWORD),
+  ("GlblcntUsage",wintypes.DWORD),("ProccntUsage",wintypes.DWORD),
+  ("modBaseAddr",ctypes.POINTER(ctypes.c_byte)),("modBaseSize",wintypes.DWORD),
+  ("hModule",wintypes.HMODULE),("szModule",wintypes.WCHAR*256),("szExePath",wintypes.WCHAR*260)
+ ]
+
+def kernel32():
+    k=ctypes.WinDLL("kernel32",use_last_error=True)
+    k.CreateToolhelp32Snapshot.argtypes=[wintypes.DWORD,wintypes.DWORD]
+    k.CreateToolhelp32Snapshot.restype=wintypes.HANDLE
+    k.Process32FirstW.argtypes=[wintypes.HANDLE,ctypes.POINTER(PROCESSENTRY32W)]
+    k.Process32FirstW.restype=wintypes.BOOL
+    k.Process32NextW.argtypes=[wintypes.HANDLE,ctypes.POINTER(PROCESSENTRY32W)]
+    k.Process32NextW.restype=wintypes.BOOL
+    k.Module32FirstW.argtypes=[wintypes.HANDLE,ctypes.POINTER(MODULEENTRY32W)]
+    k.Module32FirstW.restype=wintypes.BOOL
+    k.Module32NextW.argtypes=[wintypes.HANDLE,ctypes.POINTER(MODULEENTRY32W)]
+    k.Module32NextW.restype=wintypes.BOOL
+    k.CloseHandle.argtypes=[wintypes.HANDLE]
+    k.CloseHandle.restype=wintypes.BOOL
+    k.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]
+    k.OpenProcess.restype=wintypes.HANDLE
+    k.ReadProcessMemory.argtypes=[
+        wintypes.HANDLE,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_size_t,ctypes.POINTER(ctypes.c_size_t)
+    ]
+    k.ReadProcessMemory.restype=wintypes.BOOL
+    return k
 
 def find_process():
- k=ctypes.WinDLL("kernel32",use_last_error=True)
+ k=kernel32()
  TH32CS_SNAPPROCESS=0x00000002
  snap=k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0)
- if snap in (0,-1): return None
+ if not snap or ctypes.c_void_p(snap).value == ctypes.c_void_p(-1).value:
+  return None
  try:
   e=PROCESSENTRY32W(); e.dwSize=ctypes.sizeof(e)
   ok=k.Process32FirstW(snap,ctypes.byref(e))
@@ -64,11 +97,14 @@ def find_process():
  return None
 
 def module_base(pid):
- k=ctypes.WinDLL("kernel32",use_last_error=True)
+ k=kernel32()
  TH32CS_SNAPMODULE=0x00000008
  TH32CS_SNAPMODULE32=0x00000010
  snap=k.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid)
- if snap in (0,-1): return None
+ if not snap or ctypes.c_void_p(snap).value == ctypes.c_void_p(-1).value:
+  err=ctypes.get_last_error()
+  print(f"Module snapshot failed: WinError {err}",flush=True)
+  return None
  try:
   m=MODULEENTRY32W();m.dwSize=ctypes.sizeof(m)
   ok=k.Module32FirstW(snap,ctypes.byref(m))
@@ -80,9 +116,61 @@ def module_base(pid):
   k.CloseHandle(snap)
  return None
 
+def module_base_psapi(pid):
+    k=kernel32()
+    PROCESS_QUERY_INFORMATION=0x0400
+    PROCESS_VM_READ=0x0010
+    h=k.OpenProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ,False,pid)
+    if not h:
+        return None
+    try:
+        psapi=ctypes.WinDLL("psapi",use_last_error=True)
+        psapi.EnumProcessModulesEx.argtypes=[
+            wintypes.HANDLE,ctypes.POINTER(wintypes.HMODULE),wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),wintypes.DWORD
+        ]
+        psapi.EnumProcessModulesEx.restype=wintypes.BOOL
+        psapi.GetModuleBaseNameW.argtypes=[
+            wintypes.HANDLE,wintypes.HMODULE,wintypes.LPWSTR,wintypes.DWORD
+        ]
+        psapi.GetModuleBaseNameW.restype=wintypes.DWORD
+        psapi.GetModuleFileNameExW.argtypes=[
+            wintypes.HANDLE,wintypes.HMODULE,wintypes.LPWSTR,wintypes.DWORD
+        ]
+        psapi.GetModuleFileNameExW.restype=wintypes.DWORD
+        class MODULEINFO(ctypes.Structure):
+            _fields_=[("lpBaseOfDll",ctypes.c_void_p),("SizeOfImage",wintypes.DWORD),("EntryPoint",ctypes.c_void_p)]
+        psapi.GetModuleInformation.argtypes=[
+            wintypes.HANDLE,wintypes.HMODULE,ctypes.POINTER(MODULEINFO),wintypes.DWORD
+        ]
+        psapi.GetModuleInformation.restype=wintypes.BOOL
+
+        arr=(wintypes.HMODULE*1024)()
+        needed=wintypes.DWORD()
+        LIST_MODULES_ALL=0x03
+        if not psapi.EnumProcessModulesEx(h,arr,ctypes.sizeof(arr),ctypes.byref(needed),LIST_MODULES_ALL):
+            return None
+        count=min(needed.value//ctypes.sizeof(wintypes.HMODULE),len(arr))
+        for i in range(count):
+            mod=arr[i]
+            namebuf=ctypes.create_unicode_buffer(260)
+            if not psapi.GetModuleBaseNameW(h,mod,namebuf,len(namebuf)):
+                continue
+            if namebuf.value.lower()!=PROCESS_NAME.lower():
+                continue
+            info=MODULEINFO()
+            if not psapi.GetModuleInformation(h,mod,ctypes.byref(info),ctypes.sizeof(info)):
+                continue
+            pathbuf=ctypes.create_unicode_buffer(1024)
+            psapi.GetModuleFileNameExW(h,mod,pathbuf,len(pathbuf))
+            return int(info.lpBaseOfDll),int(info.SizeOfImage),pathbuf.value
+    finally:
+        k.CloseHandle(h)
+    return None
+
 class Reader:
  def __init__(self,pid):
-  self.k=ctypes.WinDLL("kernel32",use_last_error=True)
+  self.k=kernel32()
   self.h=self.k.OpenProcess(0x0010|0x0400,False,pid)
   if not self.h: raise OSError(ctypes.get_last_error(),"OpenProcess failed")
  def close(self):
@@ -119,7 +207,6 @@ def pointer_samples(reader,blob,base,size,start_addr,max_samples=64):
  return out
 
 def copy_file_to_clipboard(path):
-    """Put the ZIP itself on the Windows clipboard as a file-drop object."""
     if os.name != "nt":
         return False, "clipboard file copy is Windows-only"
     path = str(Path(path).resolve())
@@ -159,7 +246,7 @@ def main():
  root=Path(ap.parse_args().hero_siege_dir).resolve()
  exe=choose_exe(root);h=sha256(exe)
  print("EXE SHA256:",h,flush=True)
- if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v24 anchors.")
+ if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v24.2 anchors.")
 
  d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
  if out.exists():shutil.rmtree(out)
@@ -180,7 +267,11 @@ def main():
   return
 
  mod=module_base(pid)
- if not mod:raise SystemExit("Hero_Siege.exe module base not found.")
+ if not mod:
+  print("Toolhelp module lookup failed; trying PSAPI fallback...",flush=True)
+  mod=module_base_psapi(pid)
+ if not mod:
+  raise SystemExit("Hero_Siege.exe module base not found (Toolhelp + PSAPI both failed).")
  base,mod_size,mod_path=mod
  print("Runtime PID:",pid,flush=True)
  print("Module base:",hx(base),flush=True)
