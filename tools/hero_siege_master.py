@@ -12,7 +12,7 @@ from pathlib import Path
 import argparse,csv,hashlib,json,re,shutil,struct,time,zipfile
 from collections import Counter,deque
 
-MASTER_VERSION="permanent-master-v18-repo-consumer-compare"
+MASTER_VERSION="permanent-master-v19-repo-selector-descriptors"
 EXPECTED_SHA="92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4"
 JOURNAL_ROOT=0x093D9F60
 KNOWN_REPO_CONSUMER=0x05012E80
@@ -181,7 +181,6 @@ def graph(pe,start,depth=2,max_nodes=80):
     q.append((pe.bounds(c["target"])["begin"],d+1,path+[pe.bounds(c["target"])["begin"]]))
  return out
 
-
 def raw_at_rva(pe,r,n=32):
  o=pe.off(r)
  if o is None:return None
@@ -222,15 +221,46 @@ def compare_consumers(pe):
    if inter: pairwise.append({"a":a,"b":b,"shared_refs":inter,"count":len(inter)})
  return rows,common,pairwise
 
+def describe_data_ref(pe,r,n=48):
+ o=pe.off(r)
+ if o is None:return {"rva_hex":f"0x{r:X}","unmapped":True}
+ b=pe.data[o:o+n]
+ qwords=[]; dwords=[]
+ for off in range(0,min(len(b),32),8):
+  if off+8<=len(b):
+   v=u64(b,off); rr=pe.va_to_rva(v)
+   ent={"offset":off,"value":v,"value_hex":f"0x{v:X}"}
+   if rr is not None:
+    ent["points_to_rva_hex"]=f"0x{rr:X}"
+    ent["points_to_section"]=pe.section(rr)
+    s=pe.cstr(rr,320)
+    if s:ent["points_to_string"]=s
+   qwords.append(ent)
+ for off in range(0,min(len(b),24),4):
+  if off+4<=len(b):
+   dwords.append({"offset":off,"value":u32(b,off),"value_hex":f"0x{u32(b,off):X}"})
+ return {"rva":r,"rva_hex":f"0x{r:X}","section":pe.section(r),
+         "hex":b.hex(" "),"qwords":qwords,"dwords":dwords}
+
+def selector_descriptor_report(pe,consumer_compare):
+ rows=[]
+ for c in consumer_compare:
+  if c.get("missing"):continue
+  for rr in c.get("rip_refs",[]):
+   target=rr["target"]
+   desc=describe_data_ref(pe,target,48)
+   rows.append({"consumer":c["name"],"consumer_rva_hex":c["rva_hex"],
+                "kind":rr["kind"],"target_hex":rr["target_hex"],"descriptor":desc})
+ return rows
+
 def main():
  t0=time.time();ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir");args=ap.parse_args()
  exe=choose_exe(Path(args.hero_siege_dir).resolve());h=sha256(exe)
  print("EXE SHA256:",h,flush=True)
- if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v18 anchor assumptions.")
+ if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v19 anchor assumptions.")
  pe=PE(exe);d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
  if out.exists():shutil.rmtree(out)
  out.mkdir(parents=True)
-
  token_rows=[]
  for i,tok in enumerate(TOKENS,1):
   hs=find_ascii(pe,tok);regs=[]
@@ -238,102 +268,50 @@ def main():
   uq={x["native_rva"]:x for x in regs};regs=list(uq.values())
   token_rows.append({"token":tok,"hits":hs,"registrations":regs})
   print(f"Token {i}/{len(TOKENS)} {tok}: hits={len(hs)} regs={len(regs)}",flush=True)
-
  print(f"Scanning known repo consumer 0x{KNOWN_REPO_CONSUMER:X}",flush=True)
- # v16 already identified 0x5012E80 as the Journal-side consumer referencing
- # gml_Script_GetUniqueRepoStruct. Re-scanning the enormous Journal root function
- # recursively is unnecessary and caused v17 to stall.
- repo=scan_function(pe,KNOWN_REPO_CONSUMER)
- repo_graph=graph(pe,KNOWN_REPO_CONSUMER,depth=1,max_nodes=32)
-
- # Search only the Journal neighborhood for direct CALLs to the known consumer.
- # This is a bounded raw scan, not a whole-image caller walk.
- region_start=max(0, JOURNAL_ROOT-0x400000)
- region_end=JOURNAL_ROOT+0x400000
- repo_callers=[]
+ repo=scan_function(pe,KNOWN_REPO_CONSUMER);repo_graph=graph(pe,KNOWN_REPO_CONSUMER,depth=1,max_nodes=32)
+ region_start=max(0,JOURNAL_ROOT-0x400000);region_end=JOURNAL_ROOT+0x400000;repo_callers=[]
  for a,z,u in pe.pdata:
-  if z<region_start or a>region_end: continue
-  b=pe.get(a,z); i=0; hits=[]
+  if z<region_start or a>region_end:continue
+  b=pe.get(a,z);i=0;hits=[]
   while i+5<=len(b):
    if b[i]==0xE8:
-    r=a+i; t=(r+5+s32(b,i+1))&0xffffffff
-    if t==KNOWN_REPO_CONSUMER: hits.append(r)
+    r=a+i;t=(r+5+s32(b,i+1))&0xffffffff
+    if t==KNOWN_REPO_CONSUMER:hits.append(r)
     i+=5
-   else: i+=1
-  if hits:
-   repo_callers.append({"caller_rva":a,"caller_rva_hex":f"0x{a:X}",
-                        "size":z-a,"call_sites":[f"0x{x:X}" for x in hits]})
+   else:i+=1
+  if hits:repo_callers.append({"caller_rva":a,"caller_rva_hex":f"0x{a:X}","size":z-a,"call_sites":[f"0x{x:X}" for x in hits]})
  print(f"Journal-region callers of repo consumer: {len(repo_callers)}",flush=True)
-
- # Capture exact Journal callsite byte neighborhoods. These three call sites are
- # the concrete consumer-side context we need to recover arguments/category usage.
  callsite_windows=[]
  for c in repo_callers:
   for hs in c["call_sites"]:
-   at=int(hs,16)
-   w=callsite_window(pe,at,128,128)
-   if w: callsite_windows.append(w)
+   w=callsite_window(pe,int(hs,16),128,128)
+   if w:callsite_windows.append(w)
  print(f"Captured Journal callsite windows: {len(callsite_windows)}",flush=True)
-
- # Compare sibling repository consumers. Shared RIP refs are likely runtime helpers/
- # common selectors; category-specific refs are stronger candidates for repository globals.
  consumer_compare,common_refs,pairwise_refs=compare_consumers(pe)
  print("Compared repository consumers:",len(consumer_compare),flush=True)
-
- # Also record the exact gml_Script_GetUniqueRepoStruct registration/native target.
- repo_token=next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")
- repo_nodes=[]
+ descriptor_rows=selector_descriptor_report(pe,consumer_compare);named_ptrs=[]
+ for row in descriptor_rows:
+  for q in row["descriptor"].get("qwords",[]):
+   s=q.get("points_to_string")
+   if s:named_ptrs.append({"consumer":row["consumer"],"target_hex":row["target_hex"],"offset":q["offset"],"points_to_rva_hex":q.get("points_to_rva_hex"),"string":s})
+ print(f"Resolved data-ref string pointers: {len(named_ptrs)}",flush=True)
+ repo_token=next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct");repo_nodes=[]
  for reg in repo_token["registrations"]:
   n=scan_function(pe,reg["native_rva"])
-  if n: repo_nodes.append(n)
-
- assessment={
-  "journal_root_matches_expected":bool(pe.bounds(JOURNAL_ROOT)),
-  "repo_consumer_matches_expected":bool(repo and repo["rva"]==KNOWN_REPO_CONSUMER),
-  "get_unique_repo_struct_native_nodes":[n["rva_hex"] for n in repo_nodes],
-  "get_unique_repo_struct_exact_token_hits":len(next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")["hits"]),
-  "get_unique_repo_struct_registration_count":len(next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")["registrations"]),
-  "repo_consumer_direct_call_count":len(repo["calls"]) if repo else 0,
-  "repo_consumer_rip_ref_count":len(repo["rip_refs"]) if repo else 0,
-   "repo_consumer_callers_count":len(repo_callers),
-  "journal_callsite_window_count":len(callsite_windows),
-  "compared_consumer_count":len(consumer_compare),
-  "common_rip_refs_across_compared_consumers":common_refs,
-  "recommended_next_step":
-   "Identify which RIP-loaded globals/selectors in 0x5012E80 are inputs/outputs of GetUniqueRepoStruct, then map the bounded Journal callsite around that function. "
-   "If the function only materializes a runtime struct through GameMaker variable APIs, switch to a minimal read-only runtime repository dump instead of deeper producer disassembly."
- }
-
- summary={"version":MASTER_VERSION,"architecture":"standalone-no-wrapper","analysis_mode":"journal-to-repository-consumer",
-          "exe_sha256":h,"token_results":[{"token":x["token"],"hits":len(x["hits"]),"registrations":len(x["registrations"]),
-                                          "native_rvas":[r["native_rva_hex"] for r in x["registrations"]]} for x in token_rows],
-          "journal_root_rva_hex":f"0x{JOURNAL_ROOT:X}","known_repo_consumer_rva_hex":f"0x{KNOWN_REPO_CONSUMER:X}",
-          "assessment":assessment}
- savej(out/"master_summary.json",summary)
- savej(out/"script_token_map.json",token_rows)
- savej(out/"journal_region_repo_callers.json",repo_callers)
- savej(out/"get_unique_repo_struct_native_nodes.json",repo_nodes)
- savej(out/"repo_consumer.json",repo)
- savej(out/"repo_consumer_graph.json",repo_graph)
- savej(out/"repo_consumer_callers.json",repo_callers)
- savej(out/"journal_repo_callsite_windows.json",callsite_windows)
- savej(out/"repository_consumer_compare.json",consumer_compare)
- savej(out/"repository_consumer_shared_refs.json",{"common_all":common_refs,"pairwise":pairwise_refs})
- savej(out/"strategy_assessment.json",assessment)
-
+  if n:repo_nodes.append(n)
+ assessment={"journal_root_matches_expected":bool(pe.bounds(JOURNAL_ROOT)),"repo_consumer_matches_expected":bool(repo and repo["rva"]==KNOWN_REPO_CONSUMER),"get_unique_repo_struct_native_nodes":[n["rva_hex"] for n in repo_nodes],"get_unique_repo_struct_exact_token_hits":len(repo_token["hits"]),"get_unique_repo_struct_registration_count":len(repo_token["registrations"]),"repo_consumer_direct_call_count":len(repo["calls"]) if repo else 0,"repo_consumer_rip_ref_count":len(repo["rip_refs"]) if repo else 0,"repo_consumer_callers_count":len(repo_callers),"journal_callsite_window_count":len(callsite_windows),"compared_consumer_count":len(consumer_compare),"common_rip_refs_across_compared_consumers":common_refs,"resolved_data_ref_string_pointer_count":len(named_ptrs),"recommended_next_step":"Use resolved descriptor strings to label category-specific selector/cache slots. If Unique/Normal/Runeword names resolve cleanly, continue statically to the repository variable schema; otherwise switch to a minimal read-only runtime repository dump."}
+ summary={"version":MASTER_VERSION,"architecture":"standalone-no-wrapper","analysis_mode":"journal-to-repository-consumer","exe_sha256":h,"token_results":[{"token":x["token"],"hits":len(x["hits"]),"registrations":len(x["registrations"]),"native_rvas":[r["native_rva_hex"] for r in x["registrations"]]} for x in token_rows],"journal_root_rva_hex":f"0x{JOURNAL_ROOT:X}","known_repo_consumer_rva_hex":f"0x{KNOWN_REPO_CONSUMER:X}","assessment":assessment}
+ savej(out/"master_summary.json",summary);savej(out/"script_token_map.json",token_rows);savej(out/"journal_region_repo_callers.json",repo_callers);savej(out/"get_unique_repo_struct_native_nodes.json",repo_nodes);savej(out/"repo_consumer.json",repo);savej(out/"repo_consumer_graph.json",repo_graph);savej(out/"repo_consumer_callers.json",repo_callers);savej(out/"journal_repo_callsite_windows.json",callsite_windows);savej(out/"repository_consumer_compare.json",consumer_compare);savej(out/"repository_consumer_shared_refs.json",{"common_all":common_refs,"pairwise":pairwise_refs});savej(out/"repository_selector_descriptors.json",descriptor_rows);savej(out/"repository_selector_names.json",named_ptrs);savej(out/"strategy_assessment.json",assessment)
  with (out/"script_token_map.csv").open("w",newline="",encoding="utf-8-sig") as f:
   w=csv.DictWriter(f,fieldnames=["token","hits","registrations","native_rvas"]);w.writeheader()
-  for x in token_rows:w.writerow({"token":x["token"],"hits":len(x["hits"]),"registrations":len(x["registrations"]),
-                                  "native_rvas":";".join(r["native_rva_hex"] for r in x["registrations"])})
+  for x in token_rows:w.writerow({"token":x["token"],"hits":len(x["hits"]),"registrations":len(x["registrations"]),"native_rvas":";".join(r["native_rva_hex"] for r in x["registrations"])})
  with (out/"repo_consumer_callers.csv").open("w",newline="",encoding="utf-8-sig") as f:
   w=csv.DictWriter(f,fieldnames=["caller_rva_hex","size","call_sites"]);w.writeheader()
   for x in repo_callers:w.writerow({"caller_rva_hex":x["caller_rva_hex"],"size":x["size"],"call_sites":";".join(x["call_sites"])})
-
  if zp.exists():zp.unlink()
  with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
   for p in out.rglob("*"):
    if p.is_file():z.write(p,p.relative_to(out))
- print("Done:",zp);print("Master:",MASTER_VERSION);print("Mode: journal-to-repository-consumer")
- print("Elapsed: %.1fs"%(time.time()-t0))
-
+ print("Done:",zp);print("Master:",MASTER_VERSION);print("Mode: repo-selector-descriptors");print("Elapsed: %.1fs"%(time.time()-t0))
 if __name__=="__main__":main()
