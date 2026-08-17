@@ -10,7 +10,7 @@ from pathlib import Path
 import argparse,csv,hashlib,json,re,shutil,struct,time,zipfile
 from collections import Counter,deque
 
-MASTER_VERSION="permanent-master-v14.1-standalone-resolver"
+MASTER_VERSION="permanent-master-v14.2-standalone-resolver"
 PREP=0x0C54E830
 FIELD_SETTER=0x0C566890
 TARGET=0x0C579810
@@ -126,8 +126,6 @@ def discover_registrations(pe):
                 q=d.find(needle,pos)
                 if q<0:break
                 pos=q+1
-                # YYC registration shape confirmed by v13: [name VA][native wrapper VA][metadata VA]
-                # q points at the name VA field, so the executable function pointer is q+8.
                 if q+24<=len(d):
                     fva=u64(d,q+8); frva=pe.va_to_rva(fva)
                     if frva is not None and pe.executable_rva(frva) and pe.pdata(frva):
@@ -155,6 +153,8 @@ def resolve_wrapper(pe,wrapper,max_depth=4,max_nodes=256):
             score=c.get("prep",0)*1000+c.get("setter",0)*100+c.get("target",0)*10+(info["bounds"]["size"] if info["bounds"] else 0)/100000
             hits.append({"rva":r,"rva_hex":f"0x{r:X}","depth":depth,"score":score,
                          "path":[f"0x{x:X}" for x in path],"counts":c,"bounds":info["bounds"]})
+            if r==SWORD_BEGIN:
+                break
         if depth>=max_depth:continue
         for ref in info["refs"]:
             t=ref["target"]
@@ -172,9 +172,15 @@ def main():
     out.mkdir(parents=True)
     regs=discover_registrations(pe)
     resolved=[]
-    for r in regs:
-        rr=resolve_wrapper(pe,r["wrapper_rva"])
+    total=len(regs)
+    for idx,r in enumerate(regs,1):
+        is_sword=(r["name"]=="gml_GlobalScript_DefineItemUniqueWeaponsSword")
+        rr=resolve_wrapper(pe,r["wrapper_rva"],
+                           max_depth=5 if is_sword else 1,
+                           max_nodes=160 if is_sword else 24)
         resolved.append({**r,"resolver":rr})
+        if is_sword or idx==1 or idx%10==0 or idx==total:
+            print(f"Resolver progress: {idx}/{total}  {r['name']}  nodes={rr['nodes_examined']}",flush=True)
     sword=[x for x in resolved if x["name"]=="gml_GlobalScript_DefineItemUniqueWeaponsSword"]
     sword_found=any(any(h["rva"]==SWORD_BEGIN for h in x["resolver"]["hits"]) for x in sword)
     families=Counter()
