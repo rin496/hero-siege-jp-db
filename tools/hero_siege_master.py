@@ -1,209 +1,172 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from pathlib import Path
-import argparse, ctypes, hashlib, json, os, shutil, struct, subprocess, sys, time, zipfile
-from ctypes import wintypes
-
-MASTER_VERSION="permanent-master-v24.3-auto-elevate-runtime-probe"
-EXPECTED_SHA="92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4"
-ROOT_RVA=0x11CD4BB8
-DESCRIPTORS={
- "itemAmountUnique":0x119A80D8,
- "itemArgument":0x119A80E8,
- "itemRepoRuneword":0x119A8718,
- "itemRepoUnique":0x119A8728,
- "itemRequiredText":0x119A8738,
- "gml_Script_GetUniqueRepoStruct":0x119F9B98,
- "gml_Script_GetRunewordRepoStruct":0x119F9BA8,
- "gml_Script_GetHeroicItem":0x119F9BB8,
-}
-PROCESS_NAME="Hero_Siege.exe"
-
-def sha256(p):
+import argparse,csv,hashlib,json,os,shutil,struct,subprocess,time,zipfile
+MASTER_VERSION='permanent-master-v25-static-repo-producer-xrefs'
+EXPECTED_SHA='92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4'
+JOURNAL_ROOT=0x093D9F60
+KNOWN={
+ 'DefineItemInitialization':0x04FF54F0,'GetNormalRepoStruct':0x05012370,
+ 'GetUniqueRepoStruct':0x05012E80,'GetRunewordRepoStruct':0x05013990,
+ 'GetHeroicItem':0x05013C90,'GetItemTranslationServerData':0x05014970,'GetItemMask':0x0501A4E0}
+TOKENS=['gml_Script_GetUniqueRepoStruct','gml_Script_GetNormalRepoStruct','gml_Script_GetRunewordRepoStruct','gml_Script_GetHeroicItem','gml_Script_GetItemTranslationServerData','gml_Script_GetItemMask','gml_Script_GetLootSprite','gml_Script_GetSetInformation','gml_Script_GetSetNames','gml_Script_GetSetName','gml_Script_GetItemSeed']
+def u16(b,o):return struct.unpack_from('<H',b,o)[0]
+def u32(b,o):return struct.unpack_from('<I',b,o)[0]
+def u64(b,o):return struct.unpack_from('<Q',b,o)[0]
+def s32(b,o):return struct.unpack_from('<i',b,o)[0]
+def savej(p,x):p.write_text(json.dumps(x,indent=2,ensure_ascii=False),encoding='utf-8')
+def sha(p):
  h=hashlib.sha256()
- with p.open("rb") as f:
-  for c in iter(lambda:f.read(1<<20),b""): h.update(c)
+ with p.open('rb') as f:
+  for c in iter(lambda:f.read(1<<20),b''):h.update(c)
  return h.hexdigest()
-
-def desktop():
- for p in (Path.home()/"Desktop",Path.home()/"OneDrive"/"Desktop"):
-  if p.exists(): return p
+def desk():
+ for p in (Path.home()/'Desktop',Path.home()/'OneDrive'/'Desktop'):
+  if p.exists():return p
  return Path.cwd()
-
-def choose_exe(root):
- for p in (root/"Hero_Siege.exe",root/"bin"/"Hero_Siege.exe"):
-  if p.exists(): return p
- xs=list(root.rglob("Hero_Siege.exe"))
- if not xs: raise SystemExit("Hero_Siege.exe not found")
+def exe_at(root):
+ for p in (root/'Hero_Siege.exe',root/'bin'/'Hero_Siege.exe'):
+  if p.exists():return p
+ xs=list(root.rglob('Hero_Siege.exe'))
+ if not xs:raise SystemExit('Hero_Siege.exe not found')
  return xs[0]
-
-def savej(p,x):p.write_text(json.dumps(x,indent=2,ensure_ascii=False),encoding="utf-8")
-def hx(v): return None if v is None else f"0x{v:X}"
-
-class PROCESSENTRY32W(ctypes.Structure):
- _fields_=[("dwSize",wintypes.DWORD),("cntUsage",wintypes.DWORD),("th32ProcessID",wintypes.DWORD),("th32DefaultHeapID",ctypes.c_size_t),("th32ModuleID",wintypes.DWORD),("cntThreads",wintypes.DWORD),("th32ParentProcessID",wintypes.DWORD),("pcPriClassBase",ctypes.c_long),("dwFlags",wintypes.DWORD),("szExeFile",wintypes.WCHAR*260)]
-class MODULEENTRY32W(ctypes.Structure):
- _fields_=[("dwSize",wintypes.DWORD),("th32ModuleID",wintypes.DWORD),("th32ProcessID",wintypes.DWORD),("GlblcntUsage",wintypes.DWORD),("ProccntUsage",wintypes.DWORD),("modBaseAddr",ctypes.POINTER(ctypes.c_byte)),("modBaseSize",wintypes.DWORD),("hModule",wintypes.HMODULE),("szModule",wintypes.WCHAR*256),("szExePath",wintypes.WCHAR*260)]
-
-def kernel32():
- k=ctypes.WinDLL("kernel32",use_last_error=True)
- k.CreateToolhelp32Snapshot.argtypes=[wintypes.DWORD,wintypes.DWORD];k.CreateToolhelp32Snapshot.restype=wintypes.HANDLE
- k.Process32FirstW.argtypes=[wintypes.HANDLE,ctypes.POINTER(PROCESSENTRY32W)];k.Process32FirstW.restype=wintypes.BOOL
- k.Process32NextW.argtypes=[wintypes.HANDLE,ctypes.POINTER(PROCESSENTRY32W)];k.Process32NextW.restype=wintypes.BOOL
- k.Module32FirstW.argtypes=[wintypes.HANDLE,ctypes.POINTER(MODULEENTRY32W)];k.Module32FirstW.restype=wintypes.BOOL
- k.Module32NextW.argtypes=[wintypes.HANDLE,ctypes.POINTER(MODULEENTRY32W)];k.Module32NextW.restype=wintypes.BOOL
- k.CloseHandle.argtypes=[wintypes.HANDLE];k.CloseHandle.restype=wintypes.BOOL
- k.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD];k.OpenProcess.restype=wintypes.HANDLE
- k.ReadProcessMemory.argtypes=[wintypes.HANDLE,ctypes.c_void_p,ctypes.c_void_p,ctypes.c_size_t,ctypes.POINTER(ctypes.c_size_t)];k.ReadProcessMemory.restype=wintypes.BOOL
- return k
-
-def find_process():
- k=kernel32();snap=k.CreateToolhelp32Snapshot(0x2,0)
- if not snap or ctypes.c_void_p(snap).value==ctypes.c_void_p(-1).value:return None
- try:
-  e=PROCESSENTRY32W();e.dwSize=ctypes.sizeof(e);ok=k.Process32FirstW(snap,ctypes.byref(e))
-  while ok:
-   if e.szExeFile.lower()==PROCESS_NAME.lower():return int(e.th32ProcessID)
-   ok=k.Process32NextW(snap,ctypes.byref(e))
- finally:k.CloseHandle(snap)
- return None
-
-def module_base(pid):
- k=kernel32();snap=k.CreateToolhelp32Snapshot(0x8|0x10,pid)
- if not snap or ctypes.c_void_p(snap).value==ctypes.c_void_p(-1).value:
-  print(f"Module snapshot failed: WinError {ctypes.get_last_error()}",flush=True);return None
- try:
-  m=MODULEENTRY32W();m.dwSize=ctypes.sizeof(m);ok=k.Module32FirstW(snap,ctypes.byref(m))
-  while ok:
-   if m.szModule.lower()==PROCESS_NAME.lower():return ctypes.cast(m.modBaseAddr,ctypes.c_void_p).value,int(m.modBaseSize),m.szExePath
-   ok=k.Module32NextW(snap,ctypes.byref(m))
- finally:k.CloseHandle(snap)
- return None
-
-def module_base_psapi(pid):
- k=kernel32();h=k.OpenProcess(0x0400|0x0010,False,pid)
- if not h:return None
- try:
-  psapi=ctypes.WinDLL("psapi",use_last_error=True)
-  psapi.EnumProcessModulesEx.argtypes=[wintypes.HANDLE,ctypes.POINTER(wintypes.HMODULE),wintypes.DWORD,ctypes.POINTER(wintypes.DWORD),wintypes.DWORD];psapi.EnumProcessModulesEx.restype=wintypes.BOOL
-  psapi.GetModuleBaseNameW.argtypes=[wintypes.HANDLE,wintypes.HMODULE,wintypes.LPWSTR,wintypes.DWORD];psapi.GetModuleBaseNameW.restype=wintypes.DWORD
-  psapi.GetModuleFileNameExW.argtypes=[wintypes.HANDLE,wintypes.HMODULE,wintypes.LPWSTR,wintypes.DWORD];psapi.GetModuleFileNameExW.restype=wintypes.DWORD
-  class MODULEINFO(ctypes.Structure):_fields_=[("lpBaseOfDll",ctypes.c_void_p),("SizeOfImage",wintypes.DWORD),("EntryPoint",ctypes.c_void_p)]
-  psapi.GetModuleInformation.argtypes=[wintypes.HANDLE,wintypes.HMODULE,ctypes.POINTER(MODULEINFO),wintypes.DWORD];psapi.GetModuleInformation.restype=wintypes.BOOL
-  arr=(wintypes.HMODULE*1024)();needed=wintypes.DWORD()
-  if not psapi.EnumProcessModulesEx(h,arr,ctypes.sizeof(arr),ctypes.byref(needed),0x03):return None
-  count=min(needed.value//ctypes.sizeof(wintypes.HMODULE),len(arr))
-  for i in range(count):
-   mod=arr[i];namebuf=ctypes.create_unicode_buffer(260)
-   if not psapi.GetModuleBaseNameW(h,mod,namebuf,len(namebuf)) or namebuf.value.lower()!=PROCESS_NAME.lower():continue
-   info=MODULEINFO()
-   if not psapi.GetModuleInformation(h,mod,ctypes.byref(info),ctypes.sizeof(info)):continue
-   pathbuf=ctypes.create_unicode_buffer(1024);psapi.GetModuleFileNameExW(h,mod,pathbuf,len(pathbuf))
-   return int(info.lpBaseOfDll),int(info.SizeOfImage),pathbuf.value
- finally:k.CloseHandle(h)
- return None
-
-class Reader:
- def __init__(self,pid):
-  self.k=kernel32();self.h=self.k.OpenProcess(0x10|0x400,False,pid)
-  if not self.h:raise OSError(ctypes.get_last_error(),"OpenProcess failed")
- def close(self):
-  if self.h:self.k.CloseHandle(self.h);self.h=None
- def read(self,addr,n):
-  buf=(ctypes.c_ubyte*n)();got=ctypes.c_size_t();ok=self.k.ReadProcessMemory(self.h,ctypes.c_void_p(addr),buf,n,ctypes.byref(got))
-  if not ok or got.value==0:return None
-  return bytes(buf[:got.value])
- def u64(self,addr):
-  b=self.read(addr,8);return struct.unpack("<Q",b)[0] if b and len(b)>=8 else None
-
-def ptr_class(v,base,size):
- if not v:return "null"
- if base<=v<base+size:return "module"
- if 0x10000<=v<=0x00007FFFFFFFFFFF:return "user_pointer_candidate"
- return "scalar_or_invalid"
-
-def pointer_samples(reader,blob,base,size,start_addr,max_samples=64):
+class PE:
+ def __init__(self,p):
+  self.d=p.read_bytes();q=u32(self.d,0x3c);co=q+4;n=u16(self.d,co+2);op=co+20;sz=u16(self.d,co+16);self.base=u64(self.d,op+24);self.image=u32(self.d,op+56);self.sec=[]
+  s0=op+sz
+  for i in range(n):
+   o=s0+i*40;self.sec.append({'name':self.d[o:o+8].split(b'\0',1)[0].decode('ascii','ignore'),'vs':u32(self.d,o+8),'rva':u32(self.d,o+12),'rs':u32(self.d,o+16),'rp':u32(self.d,o+20),'exec':bool(u32(self.d,o+36)&0x20000000)})
+  ps=next(s for s in self.sec if s['name']=='.pdata');self.pdata=[]
+  for i in range(ps['rs']//12):
+   o=ps['rp']+i*12;self.pdata.append((u32(self.d,o),u32(self.d,o+4),u32(self.d,o+8)))
+ def off(self,r):
+  for s in self.sec:
+   if s['rva']<=r<s['rva']+max(s['vs'],s['rs']):
+    q=r-s['rva'];return s['rp']+q if q<s['rs'] else None
+ def rvaoff(self,o):
+  for s in self.sec:
+   if s['rp']<=o<s['rp']+s['rs']:return s['rva']+o-s['rp']
+ def rva(self,va):
+  q=va-self.base;return q if 0<=q<self.image else None
+ def get(self,a,z):
+  o=self.off(a);return b'' if o is None else self.d[o:o+z-a]
+ def bounds(self,r):
+  for a,z,u in self.pdata:
+   if a<=r<z:return {'begin':a,'end':z,'size':z-a}
+ def exec(self,r):return any(s['exec'] and s['rva']<=r<s['rva']+max(s['vs'],s['rs']) for s in self.sec)
+ def cstr(self,r,n=320):
+  o=self.off(r)
+  if o is None:return None
+  b=self.d[o:o+n].split(b'\0',1)[0]
+  try:s=b.decode('utf-8')
+  except:return None
+  return s if s and all((31<ord(c)<127) or c in '\t\r\n' for c in s) else None
+def ascii_hits(pe,t):
+ out=[];b=t.encode();p=0
+ while 1:
+  q=pe.d.find(b,p)
+  if q<0:return out
+  p=q+1;r=pe.rvaoff(q)
+  if r is not None:out.append(r)
+def regs_for_name(pe,r):
+ needle=struct.pack('<Q',pe.base+r);out=[];p=0
+ while 1:
+  q=pe.d.find(needle,p)
+  if q<0:break
+  p=q+1
+  if q+16>=len(pe.d):continue
+  va=u64(pe.d,q+8);fr=pe.rva(va);bd=pe.bounds(fr) if fr is not None else None
+  if bd and pe.exec(fr):out.append(bd['begin'])
+ return sorted(set(out))
+def reg_names_for_native(pe,r):
+ needle=struct.pack('<Q',pe.base+r);p=0;out=[]
+ while 1:
+  q=pe.d.find(needle,p)
+  if q<0:break
+  p=q+1
+  if q>=8:
+   nr=pe.rva(u64(pe.d,q-8));s=pe.cstr(nr) if nr is not None else None
+   if s and s.startswith('gml_'):out.append(s)
+ return sorted(set(out))
+def desc(pe,r):
+ o=pe.off(r)
+ if o is None or o+16>len(pe.d):return None
+ cache=u64(pe.d,o);nr=pe.rva(u64(pe.d,o+8));name=pe.cstr(nr) if nr is not None else None
+ return {'target':r,'target_hex':f'0x{r:X}','cache':cache,'cache_hex':f'0x{cache:X}','name':name} if name else None
+def descriptor_table(pe):
+ ks=('item','repo','unique','runeword','heroic','normal','set','loot','affix','attribute','rarity','socket','weapon','armor')
  out=[]
- for off in range(0,len(blob)-7,8):
-  v=struct.unpack_from("<Q",blob,off)[0];cls=ptr_class(v,base,size)
-  if cls in ("scalar_or_invalid","null"):continue
-  sm=reader.read(v,32);out.append({"offset":off,"field_addr_hex":hx(start_addr+off),"value_hex":hx(v),"class":cls,"module_rva_hex":hx(v-base) if cls=="module" else None,"sample_hex":sm.hex(" ") if sm else None})
-  if len(out)>=max_samples:break
+ for r in range(0x11990000,0x119B0000,0x10):
+  x=desc(pe,r)
+  if x and any(k in x['name'].lower() for k in ks):out.append(x)
  return out
-
-def copy_file_to_clipboard(path):
- if os.name!="nt":return False,"clipboard file copy is Windows-only"
- env=os.environ.copy();env["HS_ZIP_CLIP"]=str(Path(path).resolve())
- ps="Add-Type -AssemblyName System.Windows.Forms;$c=New-Object System.Collections.Specialized.StringCollection;[void]$c.Add($env:HS_ZIP_CLIP);[System.Windows.Forms.Clipboard]::SetFileDropList($c)"
+def xrefs(pe,ds):
+ targets={x['target']:x['name'] for x in ds};out=[]
+ for s in pe.sec:
+  if not s['exec']:continue
+  b=pe.d[s['rp']:s['rp']+s['rs']];base=s['rva'];i=0
+  while i+7<=len(b):
+   cur=base+i;hit=None
+   if 0x40<=b[i]<=0x4f and b[i+1] in (0x8b,0x89,0x8d) and (b[i+2]&0xc7)==5:
+    t=(cur+7+s32(b,i+3))&0xffffffff;op=b[i+1];ln=7;i+=7
+    if t in targets:hit=(t,'read64' if op==0x8b else ('write64' if op==0x89 else 'lea64'),b[i-ln:i])
+   elif b[i] in (0x8b,0x89,0x8d) and (b[i+1]&0xc7)==5:
+    t=(cur+6+s32(b,i+2))&0xffffffff;op=b[i];ln=6;i+=6
+    if t in targets:hit=(t,'read32' if op==0x8b else ('write32' if op==0x89 else 'lea32'),b[i-ln:i])
+   else:i+=1
+   if hit:
+    bd=pe.bounds(cur);out.append({'at_hex':f'0x{cur:X}','target_hex':f'0x{hit[0]:X}','descriptor_name':targets[hit[0]],'kind':hit[1],'bytes_hex':hit[2].hex(' '),'function_rva':bd['begin'] if bd else None,'function_rva_hex':f"0x{bd['begin']:X}" if bd else None})
+ return out
+def scan_func(pe,r):
+ bd=pe.bounds(r)
+ if not bd:return None
+ b=pe.get(bd['begin'],bd['end']);calls=[];i=0
+ while i+5<=len(b):
+  if b[i]==0xe8:
+   cur=bd['begin']+i;t=(cur+5+s32(b,i+1))&0xffffffff;tb=pe.bounds(t);calls.append(tb['begin'] if tb else t);i+=5
+  else:i+=1
+ return {'rva':bd['begin'],'size':bd['size'],'calls':calls}
+def producer_report(pe,refs):
+ by={}
+ for x in refs:
+  if x['function_rva'] is not None:by.setdefault(x['function_rva'],[]).append(x)
+ rev={v:k for k,v in KNOWN.items()};out=[]
+ for fr,rr in sorted(by.items()):
+  f=scan_func(pe,fr)
+  if not f:continue
+  kc=sorted(set(rev[c] for c in f['calls'] if c in rev));names=reg_names_for_native(pe,fr)
+  out.append({'function_rva_hex':f'0x{fr:X}','size':f['size'],'registered_names':names,'descriptor_names':sorted(set(x['descriptor_name'] for x in rr)),'descriptor_xref_count':len(rr),'known_item_calls':kc,'xrefs':rr})
+ return out
+def clip(zp):
+ if os.name!='nt':return
+ env=os.environ.copy();env['Z']=str(zp.resolve());ps="Add-Type -AssemblyName System.Windows.Forms;$c=New-Object System.Collections.Specialized.StringCollection;[void]$c.Add($env:Z);[System.Windows.Forms.Clipboard]::SetFileDropList($c)"
  try:
-  p=subprocess.run(["powershell.exe","-NoProfile","-STA","-Command",ps],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=15)
-  return (True,env["HS_ZIP_CLIP"]) if p.returncode==0 else (False,p.stderr.strip() or p.stdout.strip() or f"PowerShell exit {p.returncode}")
- except Exception as e:return False,repr(e)
-
-def finish_zip_to_clipboard(zp):
- ok,detail=copy_file_to_clipboard(zp)
- print("Clipboard: ZIP file copied. You can paste it directly into ChatGPT." if ok else f"Clipboard: automatic file copy failed: {detail}",flush=True)
- return ok
-
-def is_admin():
- try:return bool(ctypes.windll.shell32.IsUserAnAdmin())
- except Exception:return False
-
-def relaunch_elevated_and_wait(script_path,game_dir):
- env=os.environ.copy();env["HS_MASTER_PY"]=str(Path(script_path).resolve());env["HS_MASTER_EXE"]=str(Path(sys.executable).resolve());env["HS_GAME_DIR"]=str(Path(game_dir).resolve())
- ps="$argList=@($env:HS_MASTER_PY,$env:HS_GAME_DIR);$p=Start-Process -FilePath $env:HS_MASTER_EXE -ArgumentList $argList -Verb RunAs -Wait -PassThru;exit $p.ExitCode"
- try:return int(subprocess.run(["powershell.exe","-NoProfile","-Command",ps],env=env,timeout=300).returncode)
- except subprocess.TimeoutExpired:return 124
- except Exception as e:print("Failed to request elevation:",repr(e),flush=True);return 125
-
+  p=subprocess.run(['powershell.exe','-NoProfile','-STA','-Command',ps],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,timeout=15);print('Clipboard: ZIP file copied. Paste it directly into ChatGPT.' if p.returncode==0 else 'Clipboard copy failed.',flush=True)
+ except:print('Clipboard copy failed.',flush=True)
 def main():
- if os.name!="nt":raise SystemExit("v24 runtime probe must run on Windows.")
- t=time.time();ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir");root=Path(ap.parse_args().hero_siege_dir).resolve();exe=choose_exe(root);h=sha256(exe)
- print("EXE SHA256:",h,flush=True)
- if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v24.3 anchors.")
- d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
+ t=time.time();a=argparse.ArgumentParser();a.add_argument('hero_siege_dir');root=Path(a.parse_args().hero_siege_dir).resolve();ex=exe_at(root);h=sha(ex);print('EXE SHA256:',h,flush=True)
+ if h!=EXPECTED_SHA:raise SystemExit('Hero_Siege.exe changed; refusing v25 anchors.')
+ pe=PE(ex);d=desk();out=d/'hero_siege_master';zp=d/'hero_siege_master.zip'
  if out.exists():shutil.rmtree(out)
  out.mkdir(parents=True)
- pid=find_process()
- if pid is None:
-  savej(out/"runtime_probe.json",{"version":MASTER_VERSION,"exe_sha256":h,"runtime_status":"game-not-running"})
-  if zp.exists():zp.unlink()
-  with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:z.write(out/"runtime_probe.json","runtime_probe.json")
-  finish_zip_to_clipboard(zp);print("Hero_Siege.exe is not running.",flush=True);return
- mod=module_base(pid)
- if not mod:
-  print("Toolhelp module lookup failed; trying PSAPI fallback...",flush=True);mod=module_base_psapi(pid)
- if not mod and not is_admin():
-  print("Access is denied. Requesting Administrator permission automatically...",flush=True);print("Please approve the Windows UAC prompt.",flush=True)
-  code=relaunch_elevated_and_wait(__file__,root);raise SystemExit(code)
- if not mod:
-  savej(out/"runtime_probe.json",{"version":MASTER_VERSION,"exe_sha256":h,"runtime_status":"module-access-denied-even-as-admin","pid":pid,"is_admin":is_admin()})
-  if zp.exists():zp.unlink()
-  with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:z.write(out/"runtime_probe.json","runtime_probe.json")
-  finish_zip_to_clipboard(zp);raise SystemExit(2)
- base,mod_size,mod_path=mod;print("Runtime PID:",pid,flush=True);print("Module base:",hx(base),flush=True);print("Module size:",hx(mod_size),flush=True)
- r=Reader(pid)
- try:
-  root_slot=base+ROOT_RVA;root_ptr=r.u64(root_slot);print("Root slot:",hx(root_slot),flush=True);print("Root pointer:",hx(root_ptr),flush=True)
-  desc=[]
-  for name,rva in DESCRIPTORS.items():
-   addr=base+rva;b=r.read(addr,16);rec={"name":name,"rva_hex":hx(rva),"address_hex":hx(addr),"bytes_hex":b.hex(" ") if b else None}
-   if b and len(b)>=16:rec["runtime_cache_u64"]=struct.unpack_from("<Q",b,0)[0];rec["runtime_cache_u32"]=struct.unpack_from("<I",b,0)[0];rec["name_pointer_hex"]=hx(struct.unpack_from("<Q",b,8)[0])
-   desc.append(rec)
-  root_blob=r.read(root_ptr,0x400) if root_ptr else None;root_info={"slot_rva_hex":hx(ROOT_RVA),"slot_address_hex":hx(root_slot),"root_pointer_hex":hx(root_ptr),"root_pointer_class":ptr_class(root_ptr,base,mod_size)}
-  if root_blob:
-   root_info["root_bytes_hex"]=root_blob.hex(" ");root_info["root_pointer_samples"]=pointer_samples(r,root_blob,base,mod_size,root_ptr,96);vtable=struct.unpack_from("<Q",root_blob,0)[0];root_info["vtable_pointer_hex"]=hx(vtable);root_info["vtable_class"]=ptr_class(vtable,base,mod_size)
-   if base<=vtable<base+mod_size:root_info["vtable_rva_hex"]=hx(vtable-base)
-   vt=r.read(vtable,0x100) if vtable else None
-   if vt:root_info["vtable_bytes_hex"]=vt.hex(" ");root_info["vtable_entries"]=[{"offset":off,"value_hex":hx(struct.unpack_from("<Q",vt,off)[0]),"module_rva_hex":hx(struct.unpack_from("<Q",vt,off)[0]-base) if base<=struct.unpack_from("<Q",vt,off)[0]<base+mod_size else None} for off in range(0,len(vt)-7,8)]
-  adj_start=base+ROOT_RVA-0x200;adj=r.read(adj_start,0x400);adj_info={"start_address_hex":hx(adj_start),"start_rva_hex":hx(ROOT_RVA-0x200),"bytes_hex":adj.hex(" ") if adj else None}
-  if adj:adj_info["pointer_samples"]=pointer_samples(r,adj,base,mod_size,adj_start,96)
-  result={"version":MASTER_VERSION,"exe_sha256":h,"runtime_status":"ok","pid":pid,"module_base_hex":hx(base),"module_size_hex":hx(mod_size),"module_path":mod_path,"root":root_info,"descriptors":desc,"adjacent_globals":adj_info,"mode":"read-only external process memory probe; no injection, no writes"}
-  savej(out/"runtime_probe.json",result);savej(out/"runtime_root.json",root_info);savej(out/"runtime_descriptors.json",desc);savej(out/"runtime_adjacent_globals.json",adj_info)
- finally:r.close()
+ tm=[]
+ for i,tok in enumerate(TOKENS,1):
+  hs=ascii_hits(pe,tok);rs=sorted(set(r for h0 in hs for r in regs_for_name(pe,h0)));tm.append({'token':tok,'hits':[f'0x{x:X}' for x in hs],'native_rvas':[f'0x{x:X}' for x in rs]});print(f'Token {i}/{len(TOKENS)} {tok}: hits={len(hs)} regs={len(rs)}',flush=True)
+ print('Scanning item/repository descriptor table...',flush=True);ds=descriptor_table(pe);print('Interesting descriptors:',len(ds),flush=True)
+ print('Scanning executable descriptor xrefs...',flush=True);xr=xrefs(pe,ds);print('Descriptor xrefs:',len(xr),flush=True)
+ pr=producer_report(pe,xr);named=sum(bool(x['registered_names']) for x in pr);linked=sum(bool(x['known_item_calls']) for x in pr);print('Functions touching descriptors:',len(pr),flush=True);print('Functions with recovered registration names:',named,flush=True);print('Functions calling known item pipeline:',linked,flush=True)
+ usage=[]
+ for x in ds:
+  a=[r for r in xr if r['descriptor_name']==x['name']];usage.append({'descriptor':x,'xref_count':len(a),'functions':sorted(set(r['function_rva_hex'] for r in a if r['function_rva_hex']))})
+ usage.sort(key=lambda x:-x['xref_count'])
+ assess={'interesting_descriptor_count':len(ds),'descriptor_xref_count':len(xr),'descriptor_user_function_count':len(pr),'named_user_function_count':named,'known_pipeline_link_count':linked,'define_item_initialization_rva_hex':'0x4FF54F0','recommended_next_step':'Prioritize named descriptor users that call DefineItemInitialization or repository getters; recover repository creation/assignment semantics statically.'}
+ savej(out/'master_summary.json',{'version':MASTER_VERSION,'architecture':'static-only-no-runtime-access','exe_sha256':h,'assessment':assess});savej(out/'script_token_map.json',tm);savej(out/'item_repository_descriptors.json',ds);savej(out/'item_repository_descriptor_xrefs.json',xr);savej(out/'item_repository_descriptor_usage_summary.json',usage);savej(out/'item_repository_producer_functions.json',pr);savej(out/'strategy_assessment.json',assess)
+ with (out/'item_repository_producer_functions.csv').open('w',newline='',encoding='utf-8-sig') as f:
+  w=csv.DictWriter(f,fieldnames=['function_rva_hex','size','registered_names','descriptor_names','known_item_calls','descriptor_xref_count']);w.writeheader()
+  for x in pr:w.writerow({'function_rva_hex':x['function_rva_hex'],'size':x['size'],'registered_names':';'.join(x['registered_names']),'descriptor_names':';'.join(x['descriptor_names']),'known_item_calls':';'.join(x['known_item_calls']),'descriptor_xref_count':x['descriptor_xref_count']})
  if zp.exists():zp.unlink()
- with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
-  for p in out.rglob("*"):
+ with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED) as z:
+  for p in out.rglob('*'):
    if p.is_file():z.write(p,p.relative_to(out))
- finish_zip_to_clipboard(zp);print("Done:",zp);print("Master:",MASTER_VERSION);print("Elapsed: %.1fs"%(time.time()-t))
-if __name__=="__main__":main()
+ clip(zp);print('Done:',zp);print('Master:',MASTER_VERSION);print('Elapsed: %.1fs'%(time.time()-t))
+if __name__=='__main__':main()
