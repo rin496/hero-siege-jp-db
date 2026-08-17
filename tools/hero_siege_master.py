@@ -12,7 +12,7 @@ from pathlib import Path
 import argparse,csv,hashlib,json,re,shutil,struct,time,zipfile
 from collections import Counter,deque
 
-MASTER_VERSION="permanent-master-v21-variable-access-protocol"
+MASTER_VERSION="permanent-master-v22-receiver-and-return-flow"
 EXPECTED_SHA="92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4"
 JOURNAL_ROOT=0x093D9F60
 KNOWN_REPO_CONSUMER=0x05012E80
@@ -181,6 +181,7 @@ def graph(pe,start,depth=2,max_nodes=80):
     q.append((pe.bounds(c["target"])["begin"],d+1,path+[pe.bounds(c["target"])["begin"]]))
  return out
 
+
 def raw_at_rva(pe,r,n=32):
  o=pe.off(r)
  if o is None:return None
@@ -221,6 +222,7 @@ def compare_consumers(pe):
    if inter: pairwise.append({"a":a,"b":b,"shared_refs":inter,"count":len(inter)})
  return rows,common,pairwise
 
+
 def describe_data_ref(pe,r,n=48):
  o=pe.off(r)
  if o is None:return {"rva_hex":f"0x{r:X}","unmapped":True}
@@ -256,6 +258,8 @@ def selector_descriptor_report(pe,consumer_compare):
 def exact_descriptor_label(pe,target):
  o=pe.off(target)
  if o is None:return None
+ # GameMaker descriptor layout observed in v19:
+ # [cached/index qword][name pointer qword], 16-byte stride.
  if o+16>len(pe.data):return None
  cache=u64(pe.data,o); nameva=u64(pe.data,o+8); nr=pe.va_to_rva(nameva)
  return {"target_hex":f"0x{target:X}","cache_value":cache,"cache_value_hex":f"0x{cache:X}",
@@ -286,31 +290,100 @@ def find_variable_access_protocols(pe, consumer_compare):
   if not bd: continue
   b=pe.get(bd["begin"],bd["end"]); a=bd["begin"]
   i=0
-  while i+19<=len(b):
+  while i+16<=len(b):
    cur=a+i
-   if (b[i:i+3]==b"\x48\x8b\x0d" and b[i+7:i+9]==b"\x8b\x15" and
-       b[i+13:i+19]==b"\x48\x8b\x01\xff\x50\x08"):
+   # pattern:
+   # 48 8B 0D disp32      mov rcx,[rip+receiver]
+   # 8B 15 disp32         mov edx,[rip+descriptor]
+   # 48 8B 01 FF 50 08    mov rax,[rcx]; call qword [rax+8]
+   if (i+19<=len(b) and b[i:i+3]==b"\x48\x8b\x0d" and
+       b[i+7:i+9]==b"\x8b\x15" and b[i+13:i+19]==b"\x48\x8b\x01\xff\x50\x08"):
     recv=(cur+7+s32(b,i+3))&0xffffffff
     desc=(cur+13+s32(b,i+9))&0xffffffff
     lab=exact_descriptor_label(pe,desc)
-    out.append({"consumer":c["name"],"consumer_rva_hex":c["rva_hex"],
+    out.append({
+      "consumer":c["name"],"consumer_rva_hex":c["rva_hex"],
       "at_hex":f"0x{cur:X}","receiver_global_hex":f"0x{recv:X}",
-      "receiver_section":pe.section(recv),"receiver_raw":raw_at_rva(pe,recv,32),
-      "descriptor_hex":f"0x{desc:X}","descriptor_name":lab.get("name") if lab else None,
+      "receiver_section":pe.section(recv),
+      "receiver_raw":raw_at_rva(pe,recv,32),
+      "descriptor_hex":f"0x{desc:X}",
+      "descriptor_name":lab.get("name") if lab else None,
       "descriptor_cache":lab.get("cache_value") if lab else None,
-      "protocol":"virtual_property_lookup_rcx_receiver_edx_selector_vtable_plus_8"})
-    i+=19;continue
+      "protocol":"virtual_property_lookup_rcx_receiver_edx_selector_vtable_plus_8"
+    })
+    i+=19; continue
    i+=1
+ return out
+
+def executable_rip_xrefs(pe,target,max_hits=500):
+ out=[]
+ for s in pe.sections:
+  if not s["exec"]: continue
+  b=pe.data[s["rp"]:s["rp"]+s["rs"]]; base=s["rva"]; i=0
+  while i+7<=len(b) and len(out)<max_hits:
+   # Optional REX + MOV/LEA r64,r/m64 or MOV r/m64,r64 using RIP-relative modrm rm=101
+   if 0x40<=b[i]<=0x4F and b[i+1] in (0x8B,0x89,0x8D) and (b[i+2]&0xC7)==0x05:
+    cur=base+i; t=(cur+7+s32(b,i+3))&0xffffffff
+    if t==target:
+     op=b[i+1]
+     out.append({"at_hex":f"0x{cur:X}",
+                 "kind":"read" if op==0x8B else ("write" if op==0x89 else "lea"),
+                 "bytes_hex":b[i:i+7].hex(" ")})
+    i+=7; continue
+   if b[i] in (0x8B,0x89,0x8D) and (b[i+1]&0xC7)==0x05:
+    cur=base+i; t=(cur+6+s32(b,i+2))&0xffffffff
+    if t==target:
+     op=b[i]
+     out.append({"at_hex":f"0x{cur:X}",
+                 "kind":"read" if op==0x8B else ("write" if op==0x89 else "lea"),
+                 "bytes_hex":b[i:i+6].hex(" ")})
+    i+=6; continue
+   i+=1
+ return out
+
+def annotate_variable_access_flow(pe,accesses):
+ out=[]
+ for a0 in accesses:
+  at=int(a0["at_hex"],16); bd=pe.bounds(at)
+  if not bd: continue
+  start=at; end=min(bd["end"],at+180); b=pe.get(start,end)
+  # The virtual property call begins at +13 in the recognized pattern and ends at +19.
+  post_off=19
+  next_desc=None; next_call=None; return_store=None
+  i=post_off
+  while i<len(b):
+   cur=start+i
+   # common immediate return stores: mov [rbp+disp8/32],rax or mov reg,rax
+   if return_store is None:
+    if i+4<=len(b) and b[i:i+3] in (b"\x48\x89\x45",):
+     return_store={"at_hex":f"0x{cur:X}","bytes_hex":b[i:i+4].hex(" ")}
+    elif i+7<=len(b) and b[i:i+3]==b"\x48\x89\x85":
+     return_store={"at_hex":f"0x{cur:X}","bytes_hex":b[i:i+7].hex(" ")}
+    elif i+3<=len(b) and b[i:i+2] in (b"\x49\x89",b"\x48\x89"):
+     return_store={"at_hex":f"0x{cur:X}","bytes_hex":b[i:i+3].hex(" ")}
+   if next_desc is None and i+6<=len(b) and b[i]==0x8B and (b[i+1]&0xC7)==0x05:
+    t=(cur+6+s32(b,i+2))&0xffffffff
+    lab=exact_descriptor_label(pe,t)
+    if lab and lab.get("name"):
+     next_desc={"at_hex":f"0x{cur:X}","target_hex":f"0x{t:X}","name":lab["name"],"cache":lab["cache_value"]}
+   if b[i]==0xE8 and i+5<=len(b):
+    t=(cur+5+s32(b,i+1))&0xffffffff
+    next_call={"at_hex":f"0x{cur:X}","target_hex":f"0x{t:X}"}
+    if next_desc is not None: break
+   i+=1
+  out.append({**a0,"return_store":return_store,"next_named_descriptor":next_desc,
+              "next_direct_call":next_call,"post_bytes_hex":b[post_off:].hex(" ")})
  return out
 
 def main():
  t0=time.time();ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir");args=ap.parse_args()
  exe=choose_exe(Path(args.hero_siege_dir).resolve());h=sha256(exe)
  print("EXE SHA256:",h,flush=True)
- if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v21 anchor assumptions.")
+ if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v22 anchor assumptions.")
  pe=PE(exe);d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
  if out.exists():shutil.rmtree(out)
  out.mkdir(parents=True)
+
  token_rows=[]
  for i,tok in enumerate(TOKENS,1):
   hs=find_ascii(pe,tok);regs=[]
@@ -318,76 +391,130 @@ def main():
   uq={x["native_rva"]:x for x in regs};regs=list(uq.values())
   token_rows.append({"token":tok,"hits":hs,"registrations":regs})
   print(f"Token {i}/{len(TOKENS)} {tok}: hits={len(hs)} regs={len(regs)}",flush=True)
+
  print(f"Scanning known repo consumer 0x{KNOWN_REPO_CONSUMER:X}",flush=True)
- repo=scan_function(pe,KNOWN_REPO_CONSUMER);repo_graph=graph(pe,KNOWN_REPO_CONSUMER,depth=1,max_nodes=32)
- region_start=max(0,JOURNAL_ROOT-0x400000);region_end=JOURNAL_ROOT+0x400000;repo_callers=[]
+ repo=scan_function(pe,KNOWN_REPO_CONSUMER)
+ repo_graph=graph(pe,KNOWN_REPO_CONSUMER,depth=1,max_nodes=32)
+
+ region_start=max(0, JOURNAL_ROOT-0x400000)
+ region_end=JOURNAL_ROOT+0x400000
+ repo_callers=[]
  for a,z,u in pe.pdata:
-  if z<region_start or a>region_end:continue
-  b=pe.get(a,z);i=0;hits=[]
+  if z<region_start or a>region_end: continue
+  b=pe.get(a,z); i=0; hits=[]
   while i+5<=len(b):
    if b[i]==0xE8:
-    r=a+i;t=(r+5+s32(b,i+1))&0xffffffff
-    if t==KNOWN_REPO_CONSUMER:hits.append(r)
+    r=a+i; t=(r+5+s32(b,i+1))&0xffffffff
+    if t==KNOWN_REPO_CONSUMER: hits.append(r)
     i+=5
-   else:i+=1
-  if hits:repo_callers.append({"caller_rva":a,"caller_rva_hex":f"0x{a:X}","size":z-a,"call_sites":[f"0x{x:X}" for x in hits]})
+   else: i+=1
+  if hits:
+   repo_callers.append({"caller_rva":a,"caller_rva_hex":f"0x{a:X}",
+                        "size":z-a,"call_sites":[f"0x{x:X}" for x in hits]})
  print(f"Journal-region callers of repo consumer: {len(repo_callers)}",flush=True)
+
  callsite_windows=[]
  for c in repo_callers:
   for hs in c["call_sites"]:
-   w=callsite_window(pe,int(hs,16),128,128)
-   if w:callsite_windows.append(w)
+   at=int(hs,16)
+   w=callsite_window(pe,at,128,128)
+   if w: callsite_windows.append(w)
  print(f"Captured Journal callsite windows: {len(callsite_windows)}",flush=True)
+
  consumer_compare,common_refs,pairwise_refs=compare_consumers(pe)
  print("Compared repository consumers:",len(consumer_compare),flush=True)
+
  descriptor_rows=selector_descriptor_report(pe,consumer_compare)
  exact_labels=[]
  for row in descriptor_rows:
   lab=exact_descriptor_label(pe,int(row["target_hex"],16))
-  if lab and lab.get("name"):exact_labels.append({"consumer":row["consumer"],"consumer_rva_hex":row["consumer_rva_hex"],**lab})
+  if lab and lab.get("name"):
+   exact_labels.append({"consumer":row["consumer"],"consumer_rva_hex":row["consumer_rva_hex"],**lab})
  ref_windows=rip_ref_instruction_windows(pe,consumer_compare)
  variable_accesses=find_variable_access_protocols(pe,consumer_compare)
+ variable_access_flows=annotate_variable_access_flow(pe,variable_accesses)
+ receiver_globals=sorted(set(int(x["receiver_global_hex"],16) for x in variable_accesses))
+ receiver_xrefs={f"0x{r:X}":executable_rip_xrefs(pe,r,500) for r in receiver_globals}
  named_ptrs=[]
  for row in descriptor_rows:
   for q in row["descriptor"].get("qwords",[]):
    s=q.get("points_to_string")
-   if s:named_ptrs.append({"consumer":row["consumer"],"target_hex":row["target_hex"],"offset":q["offset"],"points_to_rva_hex":q.get("points_to_rva_hex"),"string":s})
+   if s:
+    named_ptrs.append({"consumer":row["consumer"],"target_hex":row["target_hex"],
+                       "offset":q["offset"],"points_to_rva_hex":q.get("points_to_rva_hex"),
+                       "string":s})
  print(f"Resolved data-ref string pointers: {len(named_ptrs)}",flush=True)
  print(f"Exact descriptor labels: {len(exact_labels)}",flush=True)
  print(f"RIP-ref instruction windows: {len(ref_windows)}",flush=True)
  print(f"Variable access protocols: {len(variable_accesses)}",flush=True)
- repo_token=next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct");repo_nodes=[]
+ print(f"Receiver globals: {len(receiver_globals)}",flush=True)
+ print("Receiver xrefs:",sum(len(v) for v in receiver_xrefs.values()),flush=True)
+
+ repo_token=next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")
+ repo_nodes=[]
  for reg in repo_token["registrations"]:
   n=scan_function(pe,reg["native_rva"])
-  if n:repo_nodes.append(n)
- assessment={"journal_root_matches_expected":bool(pe.bounds(JOURNAL_ROOT)),"repo_consumer_matches_expected":bool(repo and repo["rva"]==KNOWN_REPO_CONSUMER),
-  "get_unique_repo_struct_native_nodes":[n["rva_hex"] for n in repo_nodes],"get_unique_repo_struct_exact_token_hits":len(repo_token["hits"]),
-  "get_unique_repo_struct_registration_count":len(repo_token["registrations"]),"repo_consumer_direct_call_count":len(repo["calls"]) if repo else 0,
-  "repo_consumer_rip_ref_count":len(repo["rip_refs"]) if repo else 0,"repo_consumer_callers_count":len(repo_callers),
-  "journal_callsite_window_count":len(callsite_windows),"compared_consumer_count":len(consumer_compare),
-  "common_rip_refs_across_compared_consumers":common_refs,"resolved_data_ref_string_pointer_count":len(named_ptrs),
-  "exact_descriptor_label_count":len(exact_labels),"rip_ref_instruction_window_count":len(ref_windows),
+  if n: repo_nodes.append(n)
+
+ assessment={
+  "journal_root_matches_expected":bool(pe.bounds(JOURNAL_ROOT)),
+  "repo_consumer_matches_expected":bool(repo and repo["rva"]==KNOWN_REPO_CONSUMER),
+  "get_unique_repo_struct_native_nodes":[n["rva_hex"] for n in repo_nodes],
+  "get_unique_repo_struct_exact_token_hits":len(next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")["hits"]),
+  "get_unique_repo_struct_registration_count":len(next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")["registrations"]),
+  "repo_consumer_direct_call_count":len(repo["calls"]) if repo else 0,
+  "repo_consumer_rip_ref_count":len(repo["rip_refs"]) if repo else 0,
+  "repo_consumer_callers_count":len(repo_callers),
+  "journal_callsite_window_count":len(callsite_windows),
+  "compared_consumer_count":len(consumer_compare),
+  "common_rip_refs_across_compared_consumers":common_refs,
+  "resolved_data_ref_string_pointer_count":len(named_ptrs),
+  "exact_descriptor_label_count":len(exact_labels),
+  "rip_ref_instruction_window_count":len(ref_windows),
   "variable_access_protocol_count":len(variable_accesses),
-  "recommended_next_step":"Use recovered receiver-global + descriptor-name property lookups to identify which GameMaker object owns itemRepoUnique/itemRepoRuneword/itemRequiredText and trace returned RValues. If repository objects remain runtime-only after this mapping, switch to a minimal read-only runtime dump."}
- summary={"version":MASTER_VERSION,"architecture":"standalone-no-wrapper","analysis_mode":"journal-to-repository-consumer","exe_sha256":h,
-  "token_results":[{"token":x["token"],"hits":len(x["hits"]),"registrations":len(x["registrations"]),"native_rvas":[r["native_rva_hex"] for r in x["registrations"]]} for x in token_rows],
-  "journal_root_rva_hex":f"0x{JOURNAL_ROOT:X}","known_repo_consumer_rva_hex":f"0x{KNOWN_REPO_CONSUMER:X}","assessment":assessment}
- savej(out/"master_summary.json",summary);savej(out/"script_token_map.json",token_rows);savej(out/"journal_region_repo_callers.json",repo_callers)
- savej(out/"get_unique_repo_struct_native_nodes.json",repo_nodes);savej(out/"repo_consumer.json",repo);savej(out/"repo_consumer_graph.json",repo_graph)
- savej(out/"repo_consumer_callers.json",repo_callers);savej(out/"journal_repo_callsite_windows.json",callsite_windows)
- savej(out/"repository_consumer_compare.json",consumer_compare);savej(out/"repository_consumer_shared_refs.json",{"common_all":common_refs,"pairwise":pairwise_refs})
- savej(out/"repository_selector_descriptors.json",descriptor_rows);savej(out/"repository_selector_names.json",named_ptrs)
- savej(out/"repository_exact_descriptor_labels.json",exact_labels);savej(out/"repository_rip_ref_instruction_windows.json",ref_windows)
- savej(out/"repository_variable_access_protocols.json",variable_accesses);savej(out/"strategy_assessment.json",assessment)
+  "receiver_global_count":len(receiver_globals),
+  "receiver_xref_count":sum(len(v) for v in receiver_xrefs.values()),
+  "recommended_next_step":
+   "Use receiver-global xrefs plus post-property-return flow to identify the owner/root object and whether the lookup result is directly fed into repository chaining. If ownership remains runtime-only, switch to a minimal read-only runtime repository dump."
+ }
+
+ summary={"version":MASTER_VERSION,"architecture":"standalone-no-wrapper","analysis_mode":"journal-to-repository-consumer",
+          "exe_sha256":h,"token_results":[{"token":x["token"],"hits":len(x["hits"]),"registrations":len(x["registrations"]),
+                                          "native_rvas":[r["native_rva_hex"] for r in x["registrations"]]} for x in token_rows],
+          "journal_root_rva_hex":f"0x{JOURNAL_ROOT:X}","known_repo_consumer_rva_hex":f"0x{KNOWN_REPO_CONSUMER:X}",
+          "assessment":assessment}
+ savej(out/"master_summary.json",summary)
+ savej(out/"script_token_map.json",token_rows)
+ savej(out/"journal_region_repo_callers.json",repo_callers)
+ savej(out/"get_unique_repo_struct_native_nodes.json",repo_nodes)
+ savej(out/"repo_consumer.json",repo)
+ savej(out/"repo_consumer_graph.json",repo_graph)
+ savej(out/"repo_consumer_callers.json",repo_callers)
+ savej(out/"journal_repo_callsite_windows.json",callsite_windows)
+ savej(out/"repository_consumer_compare.json",consumer_compare)
+ savej(out/"repository_consumer_shared_refs.json",{"common_all":common_refs,"pairwise":pairwise_refs})
+ savej(out/"repository_selector_descriptors.json",descriptor_rows)
+ savej(out/"repository_selector_names.json",named_ptrs)
+ savej(out/"repository_exact_descriptor_labels.json",exact_labels)
+ savej(out/"repository_rip_ref_instruction_windows.json",ref_windows)
+ savej(out/"repository_variable_access_protocols.json",variable_accesses)
+ savej(out/"repository_variable_access_flows.json",variable_access_flows)
+ savej(out/"repository_receiver_global_xrefs.json",receiver_xrefs)
+ savej(out/"strategy_assessment.json",assessment)
+
  with (out/"script_token_map.csv").open("w",newline="",encoding="utf-8-sig") as f:
   w=csv.DictWriter(f,fieldnames=["token","hits","registrations","native_rvas"]);w.writeheader()
-  for x in token_rows:w.writerow({"token":x["token"],"hits":len(x["hits"]),"registrations":len(x["registrations"]),"native_rvas":";".join(r["native_rva_hex"] for r in x["registrations"])})
+  for x in token_rows:w.writerow({"token":x["token"],"hits":len(x["hits"]),"registrations":len(x["registrations"]),
+                                  "native_rvas":";".join(r["native_rva_hex"] for r in x["registrations"])})
  with (out/"repo_consumer_callers.csv").open("w",newline="",encoding="utf-8-sig") as f:
   w=csv.DictWriter(f,fieldnames=["caller_rva_hex","size","call_sites"]);w.writeheader()
   for x in repo_callers:w.writerow({"caller_rva_hex":x["caller_rva_hex"],"size":x["size"],"call_sites":";".join(x["call_sites"])})
+
  if zp.exists():zp.unlink()
  with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
   for p in out.rglob("*"):
    if p.is_file():z.write(p,p.relative_to(out))
- print("Done:",zp);print("Master:",MASTER_VERSION);print("Mode: variable-access-protocol");print("Elapsed: %.1fs"%(time.time()-t0))
+ print("Done:",zp);print("Master:",MASTER_VERSION);print("Mode: receiver-and-return-flow")
+ print("Elapsed: %.1fs"%(time.time()-t0))
+
 if __name__=="__main__":main()
