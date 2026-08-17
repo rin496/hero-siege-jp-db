@@ -12,10 +12,18 @@ from pathlib import Path
 import argparse,csv,hashlib,json,re,shutil,struct,time,zipfile
 from collections import Counter,deque
 
-MASTER_VERSION="permanent-master-v17.1-journal-repo-consumer"
+MASTER_VERSION="permanent-master-v18-repo-consumer-compare"
 EXPECTED_SHA="92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4"
 JOURNAL_ROOT=0x093D9F60
 KNOWN_REPO_CONSUMER=0x05012E80
+COMPARE_CONSUMERS={
+ "Normal":0x05012370,
+ "Unique":0x05012E80,
+ "Runeword":0x05013990,
+ "Heroic":0x05013C90,
+ "Translation":0x05014970,
+ "Mask":0x0501A4E0,
+}
 
 TOKENS=[
  "gml_Script_GetUniqueRepoStruct",
@@ -173,11 +181,52 @@ def graph(pe,start,depth=2,max_nodes=80):
     q.append((pe.bounds(c["target"])["begin"],d+1,path+[pe.bounds(c["target"])["begin"]]))
  return out
 
+
+def raw_at_rva(pe,r,n=32):
+ o=pe.off(r)
+ if o is None:return None
+ b=pe.data[o:o+n]
+ return {"rva":r,"rva_hex":f"0x{r:X}","section":pe.section(r),
+         "hex":b.hex(" "),"u32":u32(b,0) if len(b)>=4 else None,
+         "u64":u64(b,0) if len(b)>=8 else None}
+
+def callsite_window(pe,at,before=96,after=96):
+ bd=pe.bounds(at)
+ if not bd:return None
+ a=max(bd["begin"],at-before);z=min(bd["end"],at+after)
+ return {"callsite_hex":f"0x{at:X}","function_begin_hex":f"0x{bd['begin']:X}",
+         "start_hex":f"0x{a:X}","end_hex":f"0x{z:X}",
+         "bytes_hex":pe.get(a,z).hex(" ")}
+
+def compare_consumers(pe):
+ rows=[]; all_ref_sets={}
+ for name,r in COMPARE_CONSUMERS.items():
+  n=scan_function(pe,r)
+  if not n:
+   rows.append({"name":name,"rva_hex":f"0x{r:X}","missing":True});continue
+  refs=[]
+  for rr in n["rip_refs"]:
+   raw=raw_at_rva(pe,rr["target"],32)
+   refs.append({**rr,"raw":raw})
+  refset=set(rr["target_hex"] for rr in n["rip_refs"])
+  all_ref_sets[name]=refset
+  rows.append({"name":name,"rva_hex":n["rva_hex"],"size":n["size"],
+               "call_count":len(n["calls"]),"rip_ref_count":len(n["rip_refs"]),
+               "string_refs":n["string_refs"],"rip_refs":refs})
+ common=sorted(set.intersection(*(s for s in all_ref_sets.values() if s))) if all_ref_sets else []
+ pairwise=[]
+ names=list(all_ref_sets)
+ for i,a in enumerate(names):
+  for b in names[i+1:]:
+   inter=sorted(all_ref_sets[a]&all_ref_sets[b])
+   if inter: pairwise.append({"a":a,"b":b,"shared_refs":inter,"count":len(inter)})
+ return rows,common,pairwise
+
 def main():
  t0=time.time();ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir");args=ap.parse_args()
  exe=choose_exe(Path(args.hero_siege_dir).resolve());h=sha256(exe)
  print("EXE SHA256:",h,flush=True)
- if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v17.1 anchor assumptions.")
+ if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v18 anchor assumptions.")
  pe=PE(exe);d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
  if out.exists():shutil.rmtree(out)
  out.mkdir(parents=True)
@@ -216,6 +265,21 @@ def main():
                         "size":z-a,"call_sites":[f"0x{x:X}" for x in hits]})
  print(f"Journal-region callers of repo consumer: {len(repo_callers)}",flush=True)
 
+ # Capture exact Journal callsite byte neighborhoods. These three call sites are
+ # the concrete consumer-side context we need to recover arguments/category usage.
+ callsite_windows=[]
+ for c in repo_callers:
+  for hs in c["call_sites"]:
+   at=int(hs,16)
+   w=callsite_window(pe,at,128,128)
+   if w: callsite_windows.append(w)
+ print(f"Captured Journal callsite windows: {len(callsite_windows)}",flush=True)
+
+ # Compare sibling repository consumers. Shared RIP refs are likely runtime helpers/
+ # common selectors; category-specific refs are stronger candidates for repository globals.
+ consumer_compare,common_refs,pairwise_refs=compare_consumers(pe)
+ print("Compared repository consumers:",len(consumer_compare),flush=True)
+
  # Also record the exact gml_Script_GetUniqueRepoStruct registration/native target.
  repo_token=next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")
  repo_nodes=[]
@@ -231,7 +295,10 @@ def main():
   "get_unique_repo_struct_registration_count":len(next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")["registrations"]),
   "repo_consumer_direct_call_count":len(repo["calls"]) if repo else 0,
   "repo_consumer_rip_ref_count":len(repo["rip_refs"]) if repo else 0,
-  "repo_consumer_callers_count":len(repo_callers),
+   "repo_consumer_callers_count":len(repo_callers),
+  "journal_callsite_window_count":len(callsite_windows),
+  "compared_consumer_count":len(consumer_compare),
+  "common_rip_refs_across_compared_consumers":common_refs,
   "recommended_next_step":
    "Identify which RIP-loaded globals/selectors in 0x5012E80 are inputs/outputs of GetUniqueRepoStruct, then map the bounded Journal callsite around that function. "
    "If the function only materializes a runtime struct through GameMaker variable APIs, switch to a minimal read-only runtime repository dump instead of deeper producer disassembly."
@@ -249,6 +316,9 @@ def main():
  savej(out/"repo_consumer.json",repo)
  savej(out/"repo_consumer_graph.json",repo_graph)
  savej(out/"repo_consumer_callers.json",repo_callers)
+ savej(out/"journal_repo_callsite_windows.json",callsite_windows)
+ savej(out/"repository_consumer_compare.json",consumer_compare)
+ savej(out/"repository_consumer_shared_refs.json",{"common_all":common_refs,"pairwise":pairwise_refs})
  savej(out/"strategy_assessment.json",assessment)
 
  with (out/"script_token_map.csv").open("w",newline="",encoding="utf-8-sig") as f:
