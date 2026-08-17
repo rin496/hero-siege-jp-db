@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from pathlib import Path
-import argparse, ctypes, hashlib, json, os, shutil, struct, time, zipfile
+import argparse, ctypes, hashlib, json, os, shutil, struct, subprocess, sys, time, zipfile
 from ctypes import wintypes
 
-MASTER_VERSION="permanent-master-v24-readonly-runtime-probe"
+MASTER_VERSION="permanent-master-v24.1-runtime-probe-clipboard"
 EXPECTED_SHA="92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4"
 ROOT_RVA=0x11CD4BB8
 DESCRIPTORS={
@@ -49,39 +49,55 @@ class MODULEENTRY32W(ctypes.Structure):
  _fields_=[("dwSize",wintypes.DWORD),("th32ModuleID",wintypes.DWORD),("th32ProcessID",wintypes.DWORD),("GlblcntUsage",wintypes.DWORD),("ProccntUsage",wintypes.DWORD),("modBaseAddr",ctypes.POINTER(ctypes.c_byte)),("modBaseSize",wintypes.DWORD),("hModule",wintypes.HMODULE),("szModule",wintypes.WCHAR*256),("szExePath",wintypes.WCHAR*260)]
 
 def find_process():
- k=ctypes.WinDLL("kernel32",use_last_error=True);snap=k.CreateToolhelp32Snapshot(0x2,0)
+ k=ctypes.WinDLL("kernel32",use_last_error=True)
+ TH32CS_SNAPPROCESS=0x00000002
+ snap=k.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0)
  if snap in (0,-1): return None
  try:
-  e=PROCESSENTRY32W();e.dwSize=ctypes.sizeof(e);ok=k.Process32FirstW(snap,ctypes.byref(e))
+  e=PROCESSENTRY32W(); e.dwSize=ctypes.sizeof(e)
+  ok=k.Process32FirstW(snap,ctypes.byref(e))
   while ok:
    if e.szExeFile.lower()==PROCESS_NAME.lower(): return int(e.th32ProcessID)
    ok=k.Process32NextW(snap,ctypes.byref(e))
- finally:k.CloseHandle(snap)
+ finally:
+  k.CloseHandle(snap)
  return None
 
 def module_base(pid):
- k=ctypes.WinDLL("kernel32",use_last_error=True);snap=k.CreateToolhelp32Snapshot(0x8|0x10,pid)
+ k=ctypes.WinDLL("kernel32",use_last_error=True)
+ TH32CS_SNAPMODULE=0x00000008
+ TH32CS_SNAPMODULE32=0x00000010
+ snap=k.CreateToolhelp32Snapshot(TH32CS_SNAPMODULE|TH32CS_SNAPMODULE32,pid)
  if snap in (0,-1): return None
  try:
-  m=MODULEENTRY32W();m.dwSize=ctypes.sizeof(m);ok=k.Module32FirstW(snap,ctypes.byref(m))
+  m=MODULEENTRY32W();m.dwSize=ctypes.sizeof(m)
+  ok=k.Module32FirstW(snap,ctypes.byref(m))
   while ok:
-   if m.szModule.lower()==PROCESS_NAME.lower(): return ctypes.cast(m.modBaseAddr,ctypes.c_void_p).value,int(m.modBaseSize),m.szExePath
+   if m.szModule.lower()==PROCESS_NAME.lower():
+    return ctypes.cast(m.modBaseAddr,ctypes.c_void_p).value,int(m.modBaseSize),m.szExePath
    ok=k.Module32NextW(snap,ctypes.byref(m))
- finally:k.CloseHandle(snap)
+ finally:
+  k.CloseHandle(snap)
  return None
 
 class Reader:
  def __init__(self,pid):
-  self.k=ctypes.WinDLL("kernel32",use_last_error=True);self.h=self.k.OpenProcess(0x10|0x400,False,pid)
+  self.k=ctypes.WinDLL("kernel32",use_last_error=True)
+  self.h=self.k.OpenProcess(0x0010|0x0400,False,pid)
   if not self.h: raise OSError(ctypes.get_last_error(),"OpenProcess failed")
  def close(self):
   if self.h:self.k.CloseHandle(self.h);self.h=None
  def read(self,addr,n):
-  buf=(ctypes.c_ubyte*n)();got=ctypes.c_size_t();ok=self.k.ReadProcessMemory(self.h,ctypes.c_void_p(addr),buf,n,ctypes.byref(got))
+  buf=(ctypes.c_ubyte*n)(); got=ctypes.c_size_t()
+  ok=self.k.ReadProcessMemory(self.h,ctypes.c_void_p(addr),buf,n,ctypes.byref(got))
   if not ok or got.value==0:return None
   return bytes(buf[:got.value])
  def u64(self,addr):
-  b=self.read(addr,8);return struct.unpack("<Q",b)[0] if b and len(b)>=8 else None
+  b=self.read(addr,8)
+  return struct.unpack("<Q",b)[0] if b and len(b)>=8 else None
+ def u32(self,addr):
+  b=self.read(addr,4)
+  return struct.unpack("<I",b)[0] if b and len(b)>=4 else None
 
 def ptr_class(v,base,size):
  if not v:return "null"
@@ -92,52 +108,147 @@ def ptr_class(v,base,size):
 def pointer_samples(reader,blob,base,size,start_addr,max_samples=64):
  out=[]
  for off in range(0,len(blob)-7,8):
-  v=struct.unpack_from("<Q",blob,off)[0];cls=ptr_class(v,base,size)
-  if cls in ("scalar_or_invalid","null"):continue
-  sm=reader.read(v,32);out.append({"offset":off,"field_addr_hex":hx(start_addr+off),"value_hex":hx(v),"class":cls,"module_rva_hex":hx(v-base) if cls=="module" else None,"sample_hex":sm.hex(" ") if sm else None})
+  v=struct.unpack_from("<Q",blob,off)[0]
+  cls=ptr_class(v,base,size)
+  if cls=="scalar_or_invalid" or cls=="null":continue
+  sm=reader.read(v,32)
+  out.append({"offset":off,"field_addr_hex":hx(start_addr+off),"value_hex":hx(v),
+              "class":cls,"module_rva_hex":hx(v-base) if cls=="module" else None,
+              "sample_hex":sm.hex(" ") if sm else None})
   if len(out)>=max_samples:break
  return out
 
+def copy_file_to_clipboard(path):
+    """Put the ZIP itself on the Windows clipboard as a file-drop object."""
+    if os.name != "nt":
+        return False, "clipboard file copy is Windows-only"
+    path = str(Path(path).resolve())
+    ps = (
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "$c=New-Object System.Collections.Specialized.StringCollection;"
+        "[void]$c.Add($env:HS_ZIP_CLIP);"
+        "[System.Windows.Forms.Clipboard]::SetFileDropList($c)"
+    )
+    env = os.environ.copy()
+    env["HS_ZIP_CLIP"] = path
+    try:
+        p = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-STA", "-Command", ps],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=15
+        )
+        if p.returncode == 0:
+            return True, path
+        return False, (p.stderr.strip() or p.stdout.strip() or f"PowerShell exit {p.returncode}")
+    except Exception as e:
+        return False, repr(e)
+
+def finish_zip_to_clipboard(zp):
+    ok, detail = copy_file_to_clipboard(zp)
+    if ok:
+        print("Clipboard: ZIP file copied. You can paste it directly into ChatGPT.", flush=True)
+    else:
+        print("Clipboard: automatic file copy failed:", detail, flush=True)
+    return ok
+
 def main():
- if os.name!="nt": raise SystemExit("v24 runtime probe must run on Windows.")
- t=time.time();ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir");root=Path(ap.parse_args().hero_siege_dir).resolve();exe=choose_exe(root);h=sha256(exe)
+ if os.name!="nt":
+  raise SystemExit("v24 runtime probe must run on Windows.")
+ t=time.time()
+ ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir")
+ root=Path(ap.parse_args().hero_siege_dir).resolve()
+ exe=choose_exe(root);h=sha256(exe)
  print("EXE SHA256:",h,flush=True)
  if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v24 anchors.")
+
  d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
  if out.exists():shutil.rmtree(out)
  out.mkdir(parents=True)
+
  pid=find_process()
  if pid is None:
-  status={"version":MASTER_VERSION,"exe_sha256":h,"runtime_status":"game-not-running","instruction":"Start Hero Siege, wait until the main menu or character is loaded, then run Master again."};savej(out/"runtime_probe.json",status)
+  status={"version":MASTER_VERSION,"exe_sha256":h,"runtime_status":"game-not-running",
+          "instruction":"Start Hero Siege, wait until the main menu or character is loaded, then run Master again."}
+  savej(out/"runtime_probe.json",status)
   if zp.exists():zp.unlink()
-  with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:z.write(out/"runtime_probe.json","runtime_probe.json")
-  print("Hero_Siege.exe is not running.",flush=True);print("Start the game, wait until the main menu or character is loaded, then run Master again.",flush=True);print("Done:",zp);print("Master:",MASTER_VERSION);return
+  with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
+   z.write(out/"runtime_probe.json","runtime_probe.json")
+  print("Hero_Siege.exe is not running.",flush=True)
+  print("Start the game, wait until the main menu or character is loaded, then run Master again.",flush=True)
+  finish_zip_to_clipboard(zp)
+  print("Done:",zp);print("Master:",MASTER_VERSION)
+  return
+
  mod=module_base(pid)
  if not mod:raise SystemExit("Hero_Siege.exe module base not found.")
- base,mod_size,mod_path=mod;print("Runtime PID:",pid,flush=True);print("Module base:",hx(base),flush=True);print("Module size:",hx(mod_size),flush=True)
+ base,mod_size,mod_path=mod
+ print("Runtime PID:",pid,flush=True)
+ print("Module base:",hx(base),flush=True)
+ print("Module size:",hx(mod_size),flush=True)
+
  r=Reader(pid)
  try:
-  root_slot=base+ROOT_RVA;root_ptr=r.u64(root_slot);print("Root slot:",hx(root_slot),flush=True);print("Root pointer:",hx(root_ptr),flush=True)
+  root_slot=base+ROOT_RVA
+  root_ptr=r.u64(root_slot)
+  print("Root slot:",hx(root_slot),flush=True)
+  print("Root pointer:",hx(root_ptr),flush=True)
+
   desc=[]
   for name,rva in DESCRIPTORS.items():
-   addr=base+rva;b=r.read(addr,16);rec={"name":name,"rva_hex":hx(rva),"address_hex":hx(addr),"bytes_hex":b.hex(" ") if b else None}
-   if b and len(b)>=16:rec["runtime_cache_u64"]=struct.unpack_from("<Q",b,0)[0];rec["runtime_cache_u32"]=struct.unpack_from("<I",b,0)[0];rec["name_pointer_hex"]=hx(struct.unpack_from("<Q",b,8)[0])
+   addr=base+rva
+   b=r.read(addr,16)
+   rec={"name":name,"rva_hex":hx(rva),"address_hex":hx(addr),"bytes_hex":b.hex(" ") if b else None}
+   if b and len(b)>=16:
+    rec["runtime_cache_u64"]=struct.unpack_from("<Q",b,0)[0]
+    rec["runtime_cache_u32"]=struct.unpack_from("<I",b,0)[0]
+    rec["name_pointer_hex"]=hx(struct.unpack_from("<Q",b,8)[0])
    desc.append(rec)
-  root_blob=r.read(root_ptr,0x400) if root_ptr else None;root_info={"slot_rva_hex":hx(ROOT_RVA),"slot_address_hex":hx(root_slot),"root_pointer_hex":hx(root_ptr),"root_pointer_class":ptr_class(root_ptr,base,mod_size)}
+
+  root_blob=r.read(root_ptr,0x400) if root_ptr else None
+  root_info={"slot_rva_hex":hx(ROOT_RVA),"slot_address_hex":hx(root_slot),
+             "root_pointer_hex":hx(root_ptr),"root_pointer_class":ptr_class(root_ptr,base,mod_size)}
   if root_blob:
-   root_info["root_bytes_hex"]=root_blob.hex(" ");root_info["root_pointer_samples"]=pointer_samples(r,root_blob,base,mod_size,root_ptr,96);vtable=struct.unpack_from("<Q",root_blob,0)[0];root_info["vtable_pointer_hex"]=hx(vtable);root_info["vtable_class"]=ptr_class(vtable,base,mod_size)
-   if base<=vtable<base+mod_size:root_info["vtable_rva_hex"]=hx(vtable-base)
+   root_info["root_bytes_hex"]=root_blob.hex(" ")
+   root_info["root_pointer_samples"]=pointer_samples(r,root_blob,base,mod_size,root_ptr,96)
+   vtable=struct.unpack_from("<Q",root_blob,0)[0]
+   root_info["vtable_pointer_hex"]=hx(vtable)
+   root_info["vtable_class"]=ptr_class(vtable,base,mod_size)
+   if base<=vtable<base+mod_size:
+    root_info["vtable_rva_hex"]=hx(vtable-base)
    vt=r.read(vtable,0x100) if vtable else None
    if vt:
-    root_info["vtable_bytes_hex"]=vt.hex(" ");root_info["vtable_entries"]=[{"offset":off,"value_hex":hx(struct.unpack_from("<Q",vt,off)[0]),"module_rva_hex":hx(struct.unpack_from("<Q",vt,off)[0]-base) if base<=struct.unpack_from("<Q",vt,off)[0]<base+mod_size else None} for off in range(0,len(vt)-7,8)]
-  adj_start=base+ROOT_RVA-0x200;adj=r.read(adj_start,0x400);adj_info={"start_address_hex":hx(adj_start),"start_rva_hex":hx(ROOT_RVA-0x200),"bytes_hex":adj.hex(" ") if adj else None}
-  if adj:adj_info["pointer_samples"]=pointer_samples(r,adj,base,mod_size,adj_start,96)
-  result={"version":MASTER_VERSION,"exe_sha256":h,"runtime_status":"ok","pid":pid,"module_base_hex":hx(base),"module_size_hex":hx(mod_size),"module_path":mod_path,"root":root_info,"descriptors":desc,"adjacent_globals":adj_info,"mode":"read-only external process memory probe; no injection, no writes"}
-  savej(out/"runtime_probe.json",result);savej(out/"runtime_root.json",root_info);savej(out/"runtime_descriptors.json",desc);savej(out/"runtime_adjacent_globals.json",adj_info)
- finally:r.close()
+    root_info["vtable_bytes_hex"]=vt.hex(" ")
+    ents=[]
+    for off in range(0,len(vt)-7,8):
+     v=struct.unpack_from("<Q",vt,off)[0]
+     ents.append({"offset":off,"value_hex":hx(v),
+                  "module_rva_hex":hx(v-base) if base<=v<base+mod_size else None})
+    root_info["vtable_entries"]=ents
+
+  adj_start=base+ROOT_RVA-0x200
+  adj=r.read(adj_start,0x400)
+  adj_info={"start_address_hex":hx(adj_start),"start_rva_hex":hx(ROOT_RVA-0x200),
+            "bytes_hex":adj.hex(" ") if adj else None}
+  if adj:
+   adj_info["pointer_samples"]=pointer_samples(r,adj,base,mod_size,adj_start,96)
+
+  result={"version":MASTER_VERSION,"exe_sha256":h,"runtime_status":"ok","pid":pid,
+          "module_base_hex":hx(base),"module_size_hex":hx(mod_size),"module_path":mod_path,
+          "root":root_info,"descriptors":desc,"adjacent_globals":adj_info,
+          "mode":"read-only external process memory probe; no injection, no writes"}
+  savej(out/"runtime_probe.json",result)
+  savej(out/"runtime_root.json",root_info)
+  savej(out/"runtime_descriptors.json",desc)
+  savej(out/"runtime_adjacent_globals.json",adj_info)
+ finally:
+  r.close()
+
  if zp.exists():zp.unlink()
  with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
   for p in out.rglob("*"):
    if p.is_file():z.write(p,p.relative_to(out))
+ finish_zip_to_clipboard(zp)
  print("Done:",zp);print("Master:",MASTER_VERSION);print("Elapsed: %.1fs"%(time.time()-t))
-if __name__=="__main__":main()
+
+if __name__=="__main__":
+ main()
