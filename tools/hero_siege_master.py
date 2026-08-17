@@ -10,7 +10,7 @@ from pathlib import Path
 import argparse,csv,hashlib,json,re,shutil,struct,time,zipfile
 from collections import Counter,deque
 
-MASTER_VERSION="permanent-master-v14-standalone-resolver"
+MASTER_VERSION="permanent-master-v14.1-standalone-resolver"
 PREP=0x0C54E830
 FIELD_SETTER=0x0C566890
 TARGET=0x0C579810
@@ -126,13 +126,16 @@ def discover_registrations(pe):
                 q=d.find(needle,pos)
                 if q<0:break
                 pos=q+1
-                if q>=8:
-                    fva=u64(d,q-8); frva=pe.va_to_rva(fva)
+                # YYC registration shape confirmed by v13: [name VA][native wrapper VA][metadata VA]
+                # q points at the name VA field, so the executable function pointer is q+8.
+                if q+24<=len(d):
+                    fva=u64(d,q+8); frva=pe.va_to_rva(fva)
                     if frva is not None and pe.executable_rva(frva) and pe.pdata(frva):
-                        rrva=pe.rva_from_off(q-8)
+                        rrva=pe.rva_from_off(q)
                         out.append({"name":name,"name_rva":srva,"name_rva_hex":f"0x{srva:X}",
-                            "registration_off":q-8,"registration_rva":rrva,"registration_rva_hex":f"0x{rrva:X}" if rrva is not None else None,
-                            "wrapper_va":fva,"wrapper_rva":frva,"wrapper_rva_hex":f"0x{frva:X}"})
+                            "registration_off":q,"registration_rva":rrva,"registration_rva_hex":f"0x{rrva:X}" if rrva is not None else None,
+                            "wrapper_va":fva,"wrapper_rva":frva,"wrapper_rva_hex":f"0x{frva:X}",
+                            "metadata_va":u64(d,q+16)})
     uniq={}
     for x in out:uniq[(x["name"],x["wrapper_rva"])]=x
     return list(uniq.values())
