@@ -12,7 +12,7 @@ from pathlib import Path
 import argparse,csv,hashlib,json,re,shutil,struct,time,zipfile
 from collections import Counter,deque
 
-MASTER_VERSION="permanent-master-v22-receiver-and-return-flow"
+MASTER_VERSION="permanent-master-v23-receiver-writer-scan"
 EXPECTED_SHA="92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4"
 JOURNAL_ROOT=0x093D9F60
 KNOWN_REPO_CONSUMER=0x05012E80
@@ -258,8 +258,6 @@ def selector_descriptor_report(pe,consumer_compare):
 def exact_descriptor_label(pe,target):
  o=pe.off(target)
  if o is None:return None
- # GameMaker descriptor layout observed in v19:
- # [cached/index qword][name pointer qword], 16-byte stride.
  if o+16>len(pe.data):return None
  cache=u64(pe.data,o); nameva=u64(pe.data,o+8); nr=pe.va_to_rva(nameva)
  return {"target_hex":f"0x{target:X}","cache_value":cache,"cache_value_hex":f"0x{cache:X}",
@@ -292,10 +290,6 @@ def find_variable_access_protocols(pe, consumer_compare):
   i=0
   while i+16<=len(b):
    cur=a+i
-   # pattern:
-   # 48 8B 0D disp32      mov rcx,[rip+receiver]
-   # 8B 15 disp32         mov edx,[rip+descriptor]
-   # 48 8B 01 FF 50 08    mov rax,[rcx]; call qword [rax+8]
    if (i+19<=len(b) and b[i:i+3]==b"\x48\x8b\x0d" and
        b[i+7:i+9]==b"\x8b\x15" and b[i+13:i+19]==b"\x48\x8b\x01\xff\x50\x08"):
     recv=(cur+7+s32(b,i+3))&0xffffffff
@@ -321,7 +315,6 @@ def executable_rip_xrefs(pe,target,max_hits=500):
   if not s["exec"]: continue
   b=pe.data[s["rp"]:s["rp"]+s["rs"]]; base=s["rva"]; i=0
   while i+7<=len(b) and len(out)<max_hits:
-   # Optional REX + MOV/LEA r64,r/m64 or MOV r/m64,r64 using RIP-relative modrm rm=101
    if 0x40<=b[i]<=0x4F and b[i+1] in (0x8B,0x89,0x8D) and (b[i+2]&0xC7)==0x05:
     cur=base+i; t=(cur+7+s32(b,i+3))&0xffffffff
     if t==target:
@@ -347,13 +340,11 @@ def annotate_variable_access_flow(pe,accesses):
   at=int(a0["at_hex"],16); bd=pe.bounds(at)
   if not bd: continue
   start=at; end=min(bd["end"],at+180); b=pe.get(start,end)
-  # The virtual property call begins at +13 in the recognized pattern and ends at +19.
   post_off=19
   next_desc=None; next_call=None; return_store=None
   i=post_off
   while i<len(b):
    cur=start+i
-   # common immediate return stores: mov [rbp+disp8/32],rax or mov reg,rax
    if return_store is None:
     if i+4<=len(b) and b[i:i+3] in (b"\x48\x89\x45",):
      return_store={"at_hex":f"0x{cur:X}","bytes_hex":b[i:i+4].hex(" ")}
@@ -375,11 +366,65 @@ def annotate_variable_access_flow(pe,accesses):
               "next_direct_call":next_call,"post_bytes_hex":b[post_off:].hex(" ")})
  return out
 
+def receiver_write_scan(pe,target,read_sample_limit=40):
+ writes=[]; leas=[]; reads=[]; counts={"read":0,"write":0,"lea":0}
+ for s in pe.sections:
+  if not s["exec"]: continue
+  b=pe.data[s["rp"]:s["rp"]+s["rs"]]; base=s["rva"]; i=0
+  while i+7<=len(b):
+   matched=False
+   if 0x40<=b[i]<=0x4F and b[i+1] in (0x8B,0x89,0x8D) and (b[i+2]&0xC7)==0x05:
+    cur=base+i; t=(cur+7+s32(b,i+3))&0xffffffff
+    if t==target:
+     op=b[i+1]; kind="read" if op==0x8B else ("write" if op==0x89 else "lea")
+     rec={"at_hex":f"0x{cur:X}","kind":kind,"bytes_hex":b[i:i+7].hex(" "),
+          "function_rva_hex":f"0x{pe.bounds(cur)['begin']:X}" if pe.bounds(cur) else None}
+     counts[kind]+=1
+     if kind=="write":writes.append(rec)
+     elif kind=="lea":leas.append(rec)
+     elif len(reads)<read_sample_limit:reads.append(rec)
+    i+=7;matched=True
+   elif b[i] in (0x8B,0x89,0x8D) and (b[i+1]&0xC7)==0x05:
+    cur=base+i; t=(cur+6+s32(b,i+2))&0xffffffff
+    if t==target:
+     op=b[i]; kind="read" if op==0x8B else ("write" if op==0x89 else "lea")
+     rec={"at_hex":f"0x{cur:X}","kind":kind,"bytes_hex":b[i:i+6].hex(" "),
+          "function_rva_hex":f"0x{pe.bounds(cur)['begin']:X}" if pe.bounds(cur) else None}
+     counts[kind]+=1
+     if kind=="write":writes.append(rec)
+     elif kind=="lea":leas.append(rec)
+     elif len(reads)<read_sample_limit:reads.append(rec)
+    i+=6;matched=True
+   elif i+11<=len(b) and b[i:i+3]==b"\x48\xc7\x05":
+    cur=base+i; t=(cur+11+s32(b,i+3))&0xffffffff
+    if t==target:
+     rec={"at_hex":f"0x{cur:X}","kind":"write_imm32","bytes_hex":b[i:i+11].hex(" "),
+          "imm32":u32(b,i+7),
+          "function_rva_hex":f"0x{pe.bounds(cur)['begin']:X}" if pe.bounds(cur) else None}
+     counts["write"]+=1;writes.append(rec)
+    i+=11;matched=True
+   if not matched:i+=1
+ return {"target_hex":f"0x{target:X}","counts":counts,
+         "writes":writes,"leas":leas,"read_samples":reads}
+
+def writer_contexts(pe,write_report,before=96,after=160):
+ out=[]
+ for w in write_report.get("writes",[]):
+  at=int(w["at_hex"],16);bd=pe.bounds(at)
+  if not bd:continue
+  a=max(bd["begin"],at-before);z=min(bd["end"],at+after)
+  n=scan_function(pe,bd["begin"])
+  out.append({**w,"function_begin_hex":f"0x{bd['begin']:X}",
+              "function_size":bd["size"],"window_start_hex":f"0x{a:X}",
+              "window_end_hex":f"0x{z:X}","bytes_hex":pe.get(a,z).hex(" "),
+              "function_string_refs":n["string_refs"] if n else []})
+ return out
+
 def main():
  t0=time.time();ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir");args=ap.parse_args()
  exe=choose_exe(Path(args.hero_siege_dir).resolve());h=sha256(exe)
  print("EXE SHA256:",h,flush=True)
- if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v22 anchor assumptions.")
+ if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v23 anchor assumptions.")
  pe=PE(exe);d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
  if out.exists():shutil.rmtree(out)
  out.mkdir(parents=True)
@@ -435,6 +480,8 @@ def main():
  variable_access_flows=annotate_variable_access_flow(pe,variable_accesses)
  receiver_globals=sorted(set(int(x["receiver_global_hex"],16) for x in variable_accesses))
  receiver_xrefs={f"0x{r:X}":executable_rip_xrefs(pe,r,500) for r in receiver_globals}
+ receiver_write_reports={f"0x{r:X}":receiver_write_scan(pe,r,40) for r in receiver_globals}
+ receiver_writer_contexts={k:writer_contexts(pe,v) for k,v in receiver_write_reports.items()}
  named_ptrs=[]
  for row in descriptor_rows:
   for q in row["descriptor"].get("qwords",[]):
@@ -448,7 +495,10 @@ def main():
  print(f"RIP-ref instruction windows: {len(ref_windows)}",flush=True)
  print(f"Variable access protocols: {len(variable_accesses)}",flush=True)
  print(f"Receiver globals: {len(receiver_globals)}",flush=True)
- print("Receiver xrefs:",sum(len(v) for v in receiver_xrefs.values()),flush=True)
+ print("Receiver xrefs (legacy capped):",sum(len(v) for v in receiver_xrefs.values()),flush=True)
+ print("Receiver total reads:",sum(v["counts"]["read"] for v in receiver_write_reports.values()),flush=True)
+ print("Receiver writes:",sum(v["counts"]["write"] for v in receiver_write_reports.values()),flush=True)
+ print("Receiver LEAs:",sum(v["counts"]["lea"] for v in receiver_write_reports.values()),flush=True)
 
  repo_token=next(x for x in token_rows if x["token"]=="gml_Script_GetUniqueRepoStruct")
  repo_nodes=[]
@@ -473,9 +523,13 @@ def main():
   "rip_ref_instruction_window_count":len(ref_windows),
   "variable_access_protocol_count":len(variable_accesses),
   "receiver_global_count":len(receiver_globals),
-  "receiver_xref_count":sum(len(v) for v in receiver_xrefs.values()),
+  "receiver_xref_count_legacy_capped":sum(len(v) for v in receiver_xrefs.values()),
+  "receiver_total_read_count":sum(v["counts"]["read"] for v in receiver_write_reports.values()),
+  "receiver_write_count":sum(v["counts"]["write"] for v in receiver_write_reports.values()),
+  "receiver_lea_count":sum(v["counts"]["lea"] for v in receiver_write_reports.values()),
   "recommended_next_step":
-   "Use receiver-global xrefs plus post-property-return flow to identify the owner/root object and whether the lookup result is directly fed into repository chaining. If ownership remains runtime-only, switch to a minimal read-only runtime repository dump."
+   "Use the uncapped receiver write scan to identify initialization of the common owner/root object. "
+   "If direct writes remain absent, treat the receiver as runtime-initialized framework state and pivot to a minimal read-only runtime repository dump."
  }
 
  summary={"version":MASTER_VERSION,"architecture":"standalone-no-wrapper","analysis_mode":"journal-to-repository-consumer",
@@ -500,6 +554,8 @@ def main():
  savej(out/"repository_variable_access_protocols.json",variable_accesses)
  savej(out/"repository_variable_access_flows.json",variable_access_flows)
  savej(out/"repository_receiver_global_xrefs.json",receiver_xrefs)
+ savej(out/"repository_receiver_write_scan.json",receiver_write_reports)
+ savej(out/"repository_receiver_writer_contexts.json",receiver_writer_contexts)
  savej(out/"strategy_assessment.json",assessment)
 
  with (out/"script_token_map.csv").open("w",newline="",encoding="utf-8-sig") as f:
@@ -514,7 +570,7 @@ def main():
  with zipfile.ZipFile(zp,"w",zipfile.ZIP_DEFLATED) as z:
   for p in out.rglob("*"):
    if p.is_file():z.write(p,p.relative_to(out))
- print("Done:",zp);print("Master:",MASTER_VERSION);print("Mode: receiver-and-return-flow")
+ print("Done:",zp);print("Master:",MASTER_VERSION);print("Mode: journal-to-repository-consumer")
  print("Elapsed: %.1fs"%(time.time()-t0))
 
 if __name__=="__main__":main()
