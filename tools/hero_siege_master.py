@@ -12,7 +12,7 @@ from pathlib import Path
 import argparse,csv,hashlib,json,re,shutil,struct,time,zipfile
 from collections import Counter,deque
 
-MASTER_VERSION="permanent-master-v23-receiver-writer-scan"
+MASTER_VERSION="permanent-master-v23.1-writer-only-fast-scan"
 EXPECTED_SHA="92e323592aeee63fcbdc80e9a1efe1ae7c0d12ced9fb3961b1843d2bf2f376f4"
 JOURNAL_ROOT=0x093D9F60
 KNOWN_REPO_CONSUMER=0x05012E80
@@ -181,7 +181,6 @@ def graph(pe,start,depth=2,max_nodes=80):
     q.append((pe.bounds(c["target"])["begin"],d+1,path+[pe.bounds(c["target"])["begin"]]))
  return out
 
-
 def raw_at_rva(pe,r,n=32):
  o=pe.off(r)
  if o is None:return None
@@ -221,7 +220,6 @@ def compare_consumers(pe):
    inter=sorted(all_ref_sets[a]&all_ref_sets[b])
    if inter: pairwise.append({"a":a,"b":b,"shared_refs":inter,"count":len(inter)})
  return rows,common,pairwise
-
 
 def describe_data_ref(pe,r,n=48):
  o=pe.off(r)
@@ -366,46 +364,52 @@ def annotate_variable_access_flow(pe,accesses):
               "next_direct_call":next_call,"post_bytes_hex":b[post_off:].hex(" ")})
  return out
 
-def receiver_write_scan(pe,target,read_sample_limit=40):
- writes=[]; leas=[]; reads=[]; counts={"read":0,"write":0,"lea":0}
- for s in pe.sections:
-  if not s["exec"]: continue
-  b=pe.data[s["rp"]:s["rp"]+s["rs"]]; base=s["rva"]; i=0
-  while i+7<=len(b):
-   matched=False
-   if 0x40<=b[i]<=0x4F and b[i+1] in (0x8B,0x89,0x8D) and (b[i+2]&0xC7)==0x05:
-    cur=base+i; t=(cur+7+s32(b,i+3))&0xffffffff
-    if t==target:
-     op=b[i+1]; kind="read" if op==0x8B else ("write" if op==0x89 else "lea")
-     rec={"at_hex":f"0x{cur:X}","kind":kind,"bytes_hex":b[i:i+7].hex(" "),
-          "function_rva_hex":f"0x{pe.bounds(cur)['begin']:X}" if pe.bounds(cur) else None}
-     counts[kind]+=1
-     if kind=="write":writes.append(rec)
-     elif kind=="lea":leas.append(rec)
-     elif len(reads)<read_sample_limit:reads.append(rec)
-    i+=7;matched=True
-   elif b[i] in (0x8B,0x89,0x8D) and (b[i+1]&0xC7)==0x05:
-    cur=base+i; t=(cur+6+s32(b,i+2))&0xffffffff
-    if t==target:
-     op=b[i]; kind="read" if op==0x8B else ("write" if op==0x89 else "lea")
-     rec={"at_hex":f"0x{cur:X}","kind":kind,"bytes_hex":b[i:i+6].hex(" "),
-          "function_rva_hex":f"0x{pe.bounds(cur)['begin']:X}" if pe.bounds(cur) else None}
-     counts[kind]+=1
-     if kind=="write":writes.append(rec)
-     elif kind=="lea":leas.append(rec)
-     elif len(reads)<read_sample_limit:reads.append(rec)
-    i+=6;matched=True
-   elif i+11<=len(b) and b[i:i+3]==b"\x48\xc7\x05":
-    cur=base+i; t=(cur+11+s32(b,i+3))&0xffffffff
-    if t==target:
-     rec={"at_hex":f"0x{cur:X}","kind":"write_imm32","bytes_hex":b[i:i+11].hex(" "),
-          "imm32":u32(b,i+7),
-          "function_rva_hex":f"0x{pe.bounds(cur)['begin']:X}" if pe.bounds(cur) else None}
-     counts["write"]+=1;writes.append(rec)
-    i+=11;matched=True
-   if not matched:i+=1
- return {"target_hex":f"0x{target:X}","counts":counts,
-         "writes":writes,"leas":leas,"read_samples":reads}
+def receiver_write_scan(pe,target,read_sample_limit=0):
+ # Fast writer-only scan. Search only opcode prefixes, then validate RIP disp32.
+ # Avoid full byte-by-byte traversal and avoid counting all reads.
+ writes=[]; leas=[]; tested=0
+ for sec in pe.sections:
+  if not sec["exec"]: continue
+  b=pe.data[sec["rp"]:sec["rp"]+sec["rs"]]; base=sec["rva"]
+  patterns=[]
+  for rex in range(0x40,0x50):
+   patterns.append((bytes([rex,0x89]),"write_rex",7))
+   patterns.append((bytes([rex,0x8D]),"lea_rex",7))
+  patterns += [(b"\x89","write32",6),(b"\x8D","lea32",6),(b"\x48\xC7\x05","write_imm32",11)]
+  for pat,kind,inslen in patterns:
+   pos=0
+   while True:
+    i=b.find(pat,pos)
+    if i<0: break
+    pos=i+1; tested+=1
+    if kind in ("write_rex","lea_rex"):
+     if i+7>len(b) or (b[i+2]&0xC7)!=0x05: continue
+     cur=base+i; t=(cur+7+s32(b,i+3))&0xffffffff
+     raw=b[i:i+7]
+    elif kind in ("write32","lea32"):
+     if i+6>len(b) or (b[i+1]&0xC7)!=0x05: continue
+     cur=base+i; t=(cur+6+s32(b,i+2))&0xffffffff
+     raw=b[i:i+6]
+    else:
+     if i+11>len(b): continue
+     cur=base+i; t=(cur+11+s32(b,i+3))&0xffffffff
+     raw=b[i:i+11]
+    if t!=target: continue
+    bd=pe.bounds(cur)
+    rec={"at_hex":f"0x{cur:X}","kind":kind,"bytes_hex":raw.hex(" "),
+         "function_rva_hex":f"0x{bd['begin']:X}" if bd else None}
+    if kind=="write_imm32": rec["imm32"]=u32(b,i+7)
+    if kind.startswith("write"): writes.append(rec)
+    else: leas.append(rec)
+ def dedup(xs):
+  u={}
+  for x in xs:u[(x["at_hex"],x["kind"])]=x
+  return list(u.values())
+ writes=dedup(writes);leas=dedup(leas)
+ return {"target_hex":f"0x{target:X}","scan_mode":"writer-only-bytes-find",
+         "candidate_prefix_hits_tested":tested,
+         "counts":{"read":None,"write":len(writes),"lea":len(leas)},
+         "writes":writes,"leas":leas,"read_samples":[]}
 
 def writer_contexts(pe,write_report,before=96,after=160):
  out=[]
@@ -424,7 +428,7 @@ def main():
  t0=time.time();ap=argparse.ArgumentParser();ap.add_argument("hero_siege_dir");args=ap.parse_args()
  exe=choose_exe(Path(args.hero_siege_dir).resolve());h=sha256(exe)
  print("EXE SHA256:",h,flush=True)
- if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v23 anchor assumptions.")
+ if h!=EXPECTED_SHA:raise SystemExit("Hero_Siege.exe changed; refusing v23.1 anchor assumptions.")
  pe=PE(exe);d=desktop();out=d/"hero_siege_master";zp=d/"hero_siege_master.zip"
  if out.exists():shutil.rmtree(out)
  out.mkdir(parents=True)
@@ -479,8 +483,9 @@ def main():
  variable_accesses=find_variable_access_protocols(pe,consumer_compare)
  variable_access_flows=annotate_variable_access_flow(pe,variable_accesses)
  receiver_globals=sorted(set(int(x["receiver_global_hex"],16) for x in variable_accesses))
- receiver_xrefs={f"0x{r:X}":executable_rip_xrefs(pe,r,500) for r in receiver_globals}
- receiver_write_reports={f"0x{r:X}":receiver_write_scan(pe,r,40) for r in receiver_globals}
+ receiver_xrefs={}  # v23.1: intentionally skipped; writer-only scan
+ print("Fast writer-only scan...",flush=True)
+ receiver_write_reports={f"0x{r:X}":receiver_write_scan(pe,r,0) for r in receiver_globals}
  receiver_writer_contexts={k:writer_contexts(pe,v) for k,v in receiver_write_reports.items()}
  named_ptrs=[]
  for row in descriptor_rows:
@@ -495,8 +500,6 @@ def main():
  print(f"RIP-ref instruction windows: {len(ref_windows)}",flush=True)
  print(f"Variable access protocols: {len(variable_accesses)}",flush=True)
  print(f"Receiver globals: {len(receiver_globals)}",flush=True)
- print("Receiver xrefs (legacy capped):",sum(len(v) for v in receiver_xrefs.values()),flush=True)
- print("Receiver total reads:",sum(v["counts"]["read"] for v in receiver_write_reports.values()),flush=True)
  print("Receiver writes:",sum(v["counts"]["write"] for v in receiver_write_reports.values()),flush=True)
  print("Receiver LEAs:",sum(v["counts"]["lea"] for v in receiver_write_reports.values()),flush=True)
 
@@ -523,13 +526,10 @@ def main():
   "rip_ref_instruction_window_count":len(ref_windows),
   "variable_access_protocol_count":len(variable_accesses),
   "receiver_global_count":len(receiver_globals),
-  "receiver_xref_count_legacy_capped":sum(len(v) for v in receiver_xrefs.values()),
-  "receiver_total_read_count":sum(v["counts"]["read"] for v in receiver_write_reports.values()),
   "receiver_write_count":sum(v["counts"]["write"] for v in receiver_write_reports.values()),
   "receiver_lea_count":sum(v["counts"]["lea"] for v in receiver_write_reports.values()),
   "recommended_next_step":
-   "Use the uncapped receiver write scan to identify initialization of the common owner/root object. "
-   "If direct writes remain absent, treat the receiver as runtime-initialized framework state and pivot to a minimal read-only runtime repository dump."
+   "If direct receiver writes are found, inspect writer contexts to identify initialization. If no direct writes are found, treat the receiver as runtime/framework state and pivot to a minimal read-only runtime repository dump rather than deeper static producer disassembly."
  }
 
  summary={"version":MASTER_VERSION,"architecture":"standalone-no-wrapper","analysis_mode":"journal-to-repository-consumer",
