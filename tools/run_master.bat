@@ -1,67 +1,110 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
-title Hero Siege Master Auto Updater
+title Hero Siege Master
 
 set "GAME_DIR=E:\SteamLibrary\steamapps\common\HeroSiege"
-set "SCRIPT=%~dp0hero_siege_master.py"
-set "SELF=%~f0"
-set "TMP_SCRIPT=%TEMP%\hero_siege_master_latest_%RANDOM%.py"
-set "TMP_BAT=%TEMP%\run_master_latest_%RANDOM%.bat"
-set "API_MASTER=https://api.github.com/repos/rin496/hero-siege-jp-db/contents/tools/hero_siege_master.py?ref=main"
-set "API_BAT=https://api.github.com/repos/rin496/hero-siege-jp-db/contents/tools/run_master.bat?ref=main"
+set "BASE=%LOCALAPPDATA%\HeroSiegeMaster"
+set "SCRIPT=%BASE%\hero_siege_master.py"
+set "LOG=%BASE%\updater.log"
+set "TMP=%BASE%\hero_siege_master.download.py"
+set "API=https://api.github.com/repos/rin496/hero-siege-jp-db/contents/tools/hero_siege_master.py?ref=main"
+
+if not exist "%BASE%" mkdir "%BASE%"
+
+> "%LOG%" echo [%date% %time%] Hero Siege Master updater
+>>"%LOG%" echo GAME_DIR=%GAME_DIR%
+>>"%LOG%" echo SCRIPT=%SCRIPT%
 
 echo ========================================
-echo Hero Siege Master Auto Updater
+echo Hero Siege Master
 echo ========================================
 echo.
+echo [1/3] Downloading current Master from GitHub...
 
-echo [0/4] Checking launcher update...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$h=@{'User-Agent'='HeroSiegeMasterUpdater';'Accept'='application/vnd.github+json';'Cache-Control'='no-cache'};$u='%API_BAT%&nocache=' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();$r=Invoke-RestMethod -Headers $h -Uri $u;$bytes=[Convert]::FromBase64String(($r.content -replace '\s',''));[IO.File]::WriteAllBytes('%TMP_BAT%',$bytes)" >nul 2>&1
-if not errorlevel 1 (
-  fc /b "%SELF%" "%TMP_BAT%" >nul 2>&1
-  if errorlevel 1 (
-    echo Launcher update found. Replacing and restarting...
-    copy /y "%TMP_BAT%" "%SELF%" >nul
-    del /q "%TMP_BAT%" >nul 2>&1
-    start "" cmd /c ""%SELF%""
-    exit /b 0
-  )
-)
-del /q "%TMP_BAT%" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+ "$ErrorActionPreference='Stop';" ^
+ "$h=@{'User-Agent'='HeroSiegeMasterUpdater';'Accept'='application/vnd.github+json';'Cache-Control'='no-cache';'Pragma'='no-cache'};" ^
+ "$u='%API%&ts=' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();" ^
+ "$r=Invoke-RestMethod -Headers $h -Uri $u;" ^
+ "$bytes=[Convert]::FromBase64String(($r.content -replace '\s',''));" ^
+ "[IO.File]::WriteAllBytes('%TMP%',$bytes);" ^
+ "$text=[Text.Encoding]::UTF8.GetString($bytes);" ^
+ "$m=[regex]::Match($text,'(?:MASTER_VERSION|VERSION)\s*=\s*[''\""]([^''\""]+)[''\""]');" ^
+ "if(-not $m.Success){throw 'Version marker not found in downloaded Master'};" ^
+ "Write-Host ('Remote blob: ' + $r.sha);" ^
+ "Write-Host ('Remote version: ' + $m.Groups[1].Value);" ^
+ "Add-Content -Encoding UTF8 '%LOG%' ('remote_blob=' + $r.sha);" ^
+ "Add-Content -Encoding UTF8 '%LOG%' ('remote_version=' + $m.Groups[1].Value)" 
 
-echo [1/4] Checking latest Master...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop';$h=@{'User-Agent'='HeroSiegeMasterUpdater';'Accept'='application/vnd.github+json';'Cache-Control'='no-cache'};$u='%API_MASTER%&nocache=' + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();$r=Invoke-RestMethod -Headers $h -Uri $u;$bytes=[Convert]::FromBase64String(($r.content -replace '\s',''));[IO.File]::WriteAllBytes('%TMP_SCRIPT%',$bytes);Write-Host ('Master blob: ' + $r.sha)"
 if errorlevel 1 (
-  echo GitHub API check failed.
-  if not exist "%SCRIPT%" (pause&exit /b 1)
-  echo Using local Master.
-) else (
-  if exist "%SCRIPT%" (
-    fc /b "%SCRIPT%" "%TMP_SCRIPT%" >nul 2>&1
-    if errorlevel 1 (copy /y "%TMP_SCRIPT%" "%SCRIPT%" >nul&echo Master updated.) else echo Master is already current.
-  ) else (copy /y "%TMP_SCRIPT%" "%SCRIPT%" >nul&echo Master downloaded.)
+  echo.
+  echo ERROR: Latest Master could not be downloaded.
+  echo The old local copy will NOT be run, to prevent stale results.
+  echo Log: %LOG%
+  pause
+  exit /b 1
 )
-del /q "%TMP_SCRIPT%" >nul 2>&1
+
+copy /y "%TMP%" "%SCRIPT%" >nul
+del /q "%TMP%" >nul 2>&1
 
 echo.
-echo [2/4] Checking environment...
-where py >nul 2>&1 || (echo Python launcher ^(py^) was not found.&pause&exit /b 1)
-if not exist "%GAME_DIR%\bin\Hero_Siege.exe" if not exist "%GAME_DIR%\Hero_Siege.exe" (echo Hero Siege was not found at:&echo %GAME_DIR%&pause&exit /b 1)
+echo [2/3] Verifying local Master...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+ "$text=Get-Content -Raw -Encoding UTF8 '%SCRIPT%';" ^
+ "$m=[regex]::Match($text,'(?:MASTER_VERSION|VERSION)\s*=\s*[''\""]([^''\""]+)[''\""]');" ^
+ "if(-not $m.Success){exit 2};" ^
+ "Write-Host ('Local version: ' + $m.Groups[1].Value);" ^
+ "Add-Content -Encoding UTF8 '%LOG%' ('local_version=' + $m.Groups[1].Value)"
+
+if errorlevel 1 (
+  echo ERROR: Downloaded Master failed verification.
+  pause
+  exit /b 1
+)
+
+where py >nul 2>&1
+if errorlevel 1 (
+  echo ERROR: Python launcher ^(py^) was not found.
+  pause
+  exit /b 1
+)
+
+if not exist "%GAME_DIR%\bin\Hero_Siege.exe" if not exist "%GAME_DIR%\Hero_Siege.exe" (
+  echo ERROR: Hero Siege was not found at:
+  echo %GAME_DIR%
+  pause
+  exit /b 1
+)
 
 echo.
-echo [3/4] Local Master version:
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$m=Select-String -Path '%SCRIPT%' -Pattern '(MASTER_VERSION|VERSION)\s*=\s*[\"''][^\"'']+[\"'']' | Select-Object -First 1;if($m){Write-Host ('  ' + $m.Matches[0].Value)}else{Write-Host '  unknown'}"
-
-echo.
-echo [4/4] Running Master...
+echo [3/3] Running Master...
 py "%SCRIPT%" "%GAME_DIR%"
 set "RESULT=%ERRORLEVEL%"
-if not "%RESULT%"=="0" (echo Master exited with error code %RESULT%.&pause&exit /b %RESULT%)
+>>"%LOG%" echo result=%RESULT%
+
+if not "%RESULT%"=="0" (
+  echo.
+  echo Master failed with exit code %RESULT%.
+  echo Log: %LOG%
+  pause
+  exit /b %RESULT%
+)
 
 echo.
 echo Analysis completed.
-if exist "%USERPROFILE%\Desktop\hero_siege_master" start "" "%USERPROFILE%\Desktop\hero_siege_master"
-if exist "%USERPROFILE%\OneDrive\Desktop\hero_siege_master" start "" "%USERPROFILE%\OneDrive\Desktop\hero_siege_master"
+
+if exist "%USERPROFILE%\Desktop\hero_siege_master" (
+  copy /y "%LOG%" "%USERPROFILE%\Desktop\hero_siege_master\updater.log" >nul
+  start "" "%USERPROFILE%\Desktop\hero_siege_master"
+)
+if exist "%USERPROFILE%\OneDrive\Desktop\hero_siege_master" (
+  copy /y "%LOG%" "%USERPROFILE%\OneDrive\Desktop\hero_siege_master\updater.log" >nul
+  start "" "%USERPROFILE%\OneDrive\Desktop\hero_siege_master"
+)
+
+echo.
+echo The updater intentionally refuses to run a stale local Master.
 echo Upload hero_siege_master.zip to ChatGPT.
 pause
