@@ -85,13 +85,13 @@ def trace_chain(pe,begin,call,start="RDI",window=0x380):
 def analyze(pe,out):
     helper=json.loads((out/"consumer_helper_0xC566890.json").read_text(encoding="utf-8"))
     primary={}
-    with (out/"primary_blocks.csv").open("r",encoding="utf-8",newline="") as f:
+    with (out/"primary_blocks.csv").open("r",encoding="utf-8-sig",newline="") as f:
         for r in csv.DictReader(f):
             primary[int(r["candidate_ordinal"])]=r
     records=[]; stats=Counter()
     for br in helper.get("blocks",[]):
         ordinal=int(br["candidate_ordinal"]); row=primary.get(ordinal,{})
-        begin=int(row.get("begin",0))
+        begin=int(str(row.get("begin","0")),0)
         for c in br.get("calls",[]):
             rcx=c.get("args",{}).get("RCX"); rec={"candidate_ordinal":ordinal,"segment_index":br.get("segment_index"),
                 "known_name":br.get("known_name"),"call_rva":c["call_rva"],"call_rva_hex":c.get("call_rva_hex"),"rcx_assignment":rcx}
