@@ -8,10 +8,10 @@ Desktop/hero_siege_master.zip. Persistent state is kept in
 Desktop/hero_siege_master_state.
 """
 from pathlib import Path
-from collections import defaultdict
-import argparse,csv,hashlib,json,math,shutil,struct,time,zipfile
+from collections import defaultdict,Counter
+import argparse,csv,hashlib,json,math,shutil,struct,zipfile
 
-VERSION="permanent-master-v2-github"
+VERSION="permanent-master-v3-github"
 FUNC_BEGIN=0x05856C00; FUNC_END=0x0588E599
 PREP=0x0C54E830; TARGET=0x0C579810; ITEM_HELPER=0x058A48A0
 VALUE_HELPER=0x56710; CLEANUP=0x56560
@@ -103,6 +103,15 @@ def near(events,call,disp):
     x=[e for e in events if e['kind']=='STORE' and e.get('disp')==disp and e.get('double') is not None and e['rva']<call and call-e['rva']<=0x140]
     return x[-1]['double'] if x else None
 
+def field_usage(events,disp):
+    out=[]
+    for e in events:
+        if e.get('disp')!=disp or e['kind'] not in ('STORE','LOAD','LEA'): continue
+        before=[x for x in events if x['kind']=='CALL' and x['rva']<e['rva'] and e['rva']-x['rva']<=0x100][-3:]
+        after=[x for x in events if x['kind']=='CALL' and x['rva']>e['rva'] and x['rva']-e['rva']<=0x100][:5]
+        out.append({'event':e,'before_calls':before,'after_calls':after,'after_targets':[x['target'] for x in after]})
+    return out
+
 def extract(pe,preps):
     rows=[]
     for n,si in enumerate(PRIMARY):
@@ -114,7 +123,7 @@ def extract(pe,preps):
         loc={k:uniq(v) for k,v in loc.items()}
         pay=[near(ev,c['rva'],0x1D0) for c in tc]
         seq=loc.get('0x1D0',[])
-        rows.append({'candidate_ordinal':n,'segment_index':si,'known_name':KNOWN.get(si),'begin':a,'end':z,'target_payload_values':pay,'local_numeric_values':loc,'canonical_0x1D0':seq,'aux_0x100':loc.get('0x100',[]),'calls':len(cs),'target_calls':len(tc),'item_helper_calls':sum(c['target']==ITEM_HELPER for c in cs),'value_helper_calls':sum(c['target']==VALUE_HELPER for c in cs),'cleanup_calls':sum(c['target']==CLEANUP for c in cs)})
+        rows.append({'candidate_ordinal':n,'segment_index':si,'known_name':KNOWN.get(si),'begin':a,'end':z,'target_payload_values':pay,'local_numeric_values':loc,'canonical_0x1D0':seq,'aux_0x100':loc.get('0x100',[]),'field_usage':{'0x100':field_usage(ev,0x100),'0x1D0':field_usage(ev,0x1D0)},'calls':len(cs),'target_calls':len(tc),'item_helper_calls':sum(c['target']==ITEM_HELPER for c in cs),'value_helper_calls':sum(c['target']==VALUE_HELPER for c in cs),'cleanup_calls':sum(c['target']==CLEANUP for c in cs)})
     return rows
 
 def local_survey(rows):
@@ -127,6 +136,17 @@ def local_survey(rows):
         for o,v in bm.items():g[v].append(o)
         out.append({'disp':d,'coverage':len(bm),'distinct':len(g),'collisions':[{'values':list(v),'ordinals':o} for v,o in g.items() if len(o)>1]})
     return sorted(out,key=lambda x:(-x['coverage'],-x['distinct'],len(x['collisions'])))
+
+def consumer_summary(rows,field):
+    kinds=Counter(); first=Counter(); seqs=Counter(); per=[]
+    for r in rows:
+        entries=[]
+        for u in r['field_usage'][field]:
+            k=u['event']['kind']; kinds[k]+=1; seq=tuple(u['after_targets'][:4])
+            if seq:first[seq[0]]+=1;seqs[seq]+=1
+            entries.append({'kind':k,'event_rva':u['event']['rva'],'value':u['event'].get('double'),'after_targets':list(seq),'after_targets_hex':[f"0x{x:X}" for x in seq]})
+        per.append({'candidate_ordinal':r['candidate_ordinal'],'known_name':r['known_name'],'values':r['local_numeric_values'].get(field,[]),'events':entries})
+    return {'field':field,'event_kind_counts':dict(kinds),'first_after_target_frequency':[{'target':t,'target_hex':f"0x{t:X}",'count':c} for t,c in first.most_common()],'after_sequence_frequency':[{'targets':list(s),'targets_hex':[f"0x{x:X}" for x in s],'count':c} for s,c in seqs.most_common()],'per_block':per}
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('hero_siege_dir');a=ap.parse_args();root=Path(a.hero_siege_dir).resolve();exe=choose(root);desk=desktop();out=desk/'hero_siege_master';state=desk/'hero_siege_master_state';state.mkdir(exist_ok=True)
@@ -148,13 +168,16 @@ def main():
     for r in rows:
         if r['known_name']:
             sub,idv=EXPECT[r['known_name']]; p=[x for x in r['target_payload_values'] if x is not None]; ids=r['aux_0x100'];val.append({'name':r['known_name'],'payload_ok':subseq(p,sub),'identity_ok':idv in ids,'overall_ok':subseq(p,sub) and idv in ids})
-    survey=local_survey(rows)
-    summary={'version':VERSION,'exe':str(exe),'exe_sha256':h,'cache_hit':bool(hit),'helper_counts':{'all_direct_calls':len(cs),'prep_calls':len(by.get(PREP,[])),'target_calls':len(by.get(TARGET,[])),'item_helper_calls':len(by.get(ITEM_HELPER,[]))},'primary_candidate_count':len(rows),'canonical_0x1D0':{'coverage':sum(bool(r['canonical_0x1D0']) for r in rows),'distinct':len(groups),'collision_count':len(col),'collisions':col},'known_validation':val,'best_local_discriminators':survey[:30]}
-    (out/'master_summary.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False),encoding='utf-8');(out/'canonical_records.json').write_text(json.dumps(rows,indent=2,ensure_ascii=False),encoding='utf-8');(out/'local_discriminator_survey.json').write_text(json.dumps(survey,indent=2,ensure_ascii=False),encoding='utf-8');(out/'canonical_record_collisions.json').write_text(json.dumps(col,indent=2,ensure_ascii=False),encoding='utf-8')
+    survey=local_survey(rows); consumers={'0x100':consumer_summary(rows,'0x100'),'0x1D0':consumer_summary(rows,'0x1D0')}
+    compact_consumers={k:{'event_kind_counts':v['event_kind_counts'],'first_after_target_frequency':v['first_after_target_frequency'][:20],'after_sequence_frequency':v['after_sequence_frequency'][:20]} for k,v in consumers.items()}
+    summary={'version':VERSION,'exe':str(exe),'exe_sha256':h,'cache_hit':bool(hit),'helper_counts':{'all_direct_calls':len(cs),'prep_calls':len(by.get(PREP,[])),'target_calls':len(by.get(TARGET,[])),'item_helper_calls':len(by.get(ITEM_HELPER,[]))},'primary_candidate_count':len(rows),'canonical_0x1D0':{'coverage':sum(bool(r['canonical_0x1D0']) for r in rows),'distinct':len(groups),'collision_count':len(col),'collisions':col},'known_validation':val,'best_local_discriminators':survey[:30],'field_consumer_summary':compact_consumers}
+    (out/'master_summary.json').write_text(json.dumps(summary,indent=2,ensure_ascii=False),encoding='utf-8');(out/'canonical_records.json').write_text(json.dumps(rows,indent=2,ensure_ascii=False),encoding='utf-8');(out/'local_discriminator_survey.json').write_text(json.dumps(survey,indent=2,ensure_ascii=False),encoding='utf-8');(out/'canonical_record_collisions.json').write_text(json.dumps(col,indent=2,ensure_ascii=False),encoding='utf-8');(out/'field_consumer_analysis.json').write_text(json.dumps(consumers,indent=2,ensure_ascii=False),encoding='utf-8')
     with (out/'primary_blocks.csv').open('w',newline='',encoding='utf-8-sig') as f:
         w=csv.writer(f);w.writerow(['ordinal','segment','known','0x1D0','0x100','TARGET'])
         for r in rows:w.writerow([r['candidate_ordinal'],r['segment_index'],r['known_name'] or '',json.dumps(r['canonical_0x1D0']),json.dumps(r['aux_0x100']),json.dumps(r['target_payload_values'])])
     diag=[f'Hero Siege Master {VERSION}',f'Cache hit: {bool(hit)}',f'Primary blocks: {len(rows)}',f'Canonical 0x1D0: {len(groups)} distinct / {len(col)} collisions','Validation:']+[f"  {v['name']}: {'OK' if v['overall_ok'] else 'CHECK'}" for v in val]
+    for field in ('0x100','0x1D0'):
+        diag.append(f'{field} first-after targets: '+repr(consumers[field]['first_after_target_frequency'][:10]))
     (out/'diagnostics.txt').write_text('\n'.join(diag),encoding='utf-8')
     if zpath.exists():zpath.unlink()
     with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED) as z:
